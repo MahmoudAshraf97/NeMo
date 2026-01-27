@@ -96,6 +96,7 @@ class CausalConv1D(nn.Conv1d):
         dtype=None,
     ) -> None:
         self.cache_drop_size = None
+        self.valid_query_length = None
         if padding is None:
             self._left_padding = kernel_size - 1
             self._right_padding = stride - 1
@@ -134,11 +135,10 @@ class CausalConv1D(nn.Conv1d):
         else:
             new_x = F.pad(x, pad=(0, self._right_padding))
             new_x = torch.cat([cache, new_x], dim=-1)
-            if self.cache_drop_size > 0:
-                next_cache = new_x[:, :, : -self.cache_drop_size]
-            else:
-                next_cache = new_x
-            next_cache = next_cache[:, :, -cache.size(-1) :]
+            cache_keep_size = self.valid_query_length - self.cache_drop_size
+            next_cache = torch.cat([cache, x[:, :, :cache_keep_size]], dim=-1)[
+                :, :, -cache.size(-1) :
+            ]
         return new_x, next_cache
 
     def forward(self, x, cache=None):

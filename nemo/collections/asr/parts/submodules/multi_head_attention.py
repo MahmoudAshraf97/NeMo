@@ -86,6 +86,7 @@ class MultiHeadAttention(nn.Module):
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
 
         self.cache_drop_size = None
+        self.valid_query_length = None
         self.use_bias = use_bias
         self.dropout_rate = dropout_rate
         assert n_feat % n_head == 0
@@ -204,7 +205,7 @@ class MultiHeadAttention(nn.Module):
     def update_cache(self, key, value, query, cache):
         if cache is not None:
             key = value = torch.cat([cache, key], dim=1)
-            q_keep_size = query.shape[1] - self.cache_drop_size
+            q_keep_size = self.valid_query_length - self.cache_drop_size
             cache = torch.cat([cache[:, q_keep_size:, :], query[:, :q_keep_size, :]], dim=1)
         return key, value, query, cache
 

@@ -1026,8 +1026,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             if hasattr(m, "_max_cache_len"):
                 if isinstance(m, MultiHeadAttention):
                     m.cache_drop_size = streaming_cfg.cache_drop_size
+                    m.valid_query_length = streaming_cfg.valid_out_len
                 if isinstance(m, CausalConv1D):
                     m.cache_drop_size = streaming_cfg.cache_drop_size
+                    m.valid_query_length = streaming_cfg.valid_out_len
 
         self.streaming_cfg = streaming_cfg
 
