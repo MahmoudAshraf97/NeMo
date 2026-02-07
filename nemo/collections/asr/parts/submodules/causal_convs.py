@@ -62,7 +62,8 @@ class CausalConv2D(nn.Conv2d):
         )
 
     def forward(
-        self, x,
+        self,
+        x,
     ):
         x = F.pad(x, pad=(self._left_padding, self._right_padding, self._left_padding, self._right_padding))
         x = super().forward(x)
@@ -136,9 +137,7 @@ class CausalConv1D(nn.Conv1d):
             new_x = F.pad(x, pad=(0, self._right_padding))
             new_x = torch.cat([cache, new_x], dim=-1)
             cache_keep_size = self.valid_query_length - self.cache_drop_size
-            next_cache = torch.cat([cache, x[:, :, :cache_keep_size]], dim=-1)[
-                :, :, -cache.size(-1) :
-            ]
+            next_cache = torch.cat([cache, x[:, :, :cache_keep_size]], dim=-1)[:, :, -cache.size(-1) :]
         return new_x, next_cache
 
     def forward(self, x, cache=None):
