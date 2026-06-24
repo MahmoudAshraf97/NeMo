@@ -355,7 +355,7 @@ class SpectrogramConformerUNet(NeuralModule):
             "input": NeuralType(('B', 'C', 'D', 'T'), SpectrogramType()),
             "input_length": NeuralType(('B',), LengthsType(), optional=True),
             # convolutional context
-            "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+            "cache_last_channel": NeuralType(('D', 'D', 'B', 'T', 'D'), ChannelType(), optional=True),
             "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
             "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
@@ -367,7 +367,7 @@ class SpectrogramConformerUNet(NeuralModule):
             "output": NeuralType(('B', 'C', 'D', 'T'), SpectrogramType()),
             "output_length": NeuralType(('B',), LengthsType(), optional=True),
             # convolutional context
-            "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+            "cache_last_channel_next": NeuralType(('D', 'D', 'B', 'T', 'D'), ChannelType(), optional=True),
             "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
             "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
         }

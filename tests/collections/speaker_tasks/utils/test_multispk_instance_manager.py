@@ -42,7 +42,7 @@ def asr_model(offline_asr_model):
     def get_initial_cache_state(batch_size=1):
         """Mock method to return initial cache state for streaming"""
         # Return dummy cache state tensors
-        cache_last_channel = torch.zeros(2, batch_size, 64)
+        cache_last_channel = torch.zeros(2, 2, batch_size, 64)
         cache_last_time = torch.zeros(2, batch_size, 64)
         cache_last_channel_len = torch.zeros(batch_size)
         return (cache_last_channel, cache_last_time, cache_last_channel_len)
@@ -180,7 +180,8 @@ class TestMultiTalkerInstanceManagerMethods:
         cache_shape = asr_state.cache_last_channel.shape
         time_shape = asr_state.cache_last_time.shape
 
-        cache_last_channel = torch.randn(cache_shape[0], cache_shape[2])  # Remove speaker dimension
+        # Remove speaker dimension
+        cache_last_channel = torch.randn(cache_shape[0], cache_shape[1], cache_shape[3])
         cache_last_time = torch.randn(time_shape[0], time_shape[2])
         cache_last_channel_len = torch.tensor([10])
 

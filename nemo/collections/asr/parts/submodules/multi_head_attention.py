@@ -158,14 +158,20 @@ class MultiHeadAttention(nn.Module):
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
             cache (torch.Tensor) : (batch, time_cache_next, size)
         """
-        key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
-
         if torch.is_autocast_enabled():
             query, key, value = query.to(torch.float32), key.to(torch.float32), value.to(torch.float32)
 
         # temporary until we solve this more gracefully
         with avoid_float16_autocast_context():
-            q, k, v = self.forward_qkv(query, key, value)
+            if cache is None:
+                q, k, v = self.forward_qkv(query, key, value)
+            else:
+                # Streaming: reuse cached post-projection K/V; only project the new frames.
+                n_batch = query.size(0)
+                k, v, cache = self.update_cache_kv(key, value, cache)
+                q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                k = k.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                v = v.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
 
             if self.use_pytorch_sdpa:
                 n_batch = value.size(0)
@@ -207,6 +213,29 @@ class MultiHeadAttention(nn.Module):
             q_keep_size = query.shape[1] - self.cache_drop_size
             cache = torch.cat([cache[:, q_keep_size:, :], query[:, :q_keep_size, :]], dim=1)
         return key, value, query, cache
+
+    def update_cache_kv(self, key, value, cache):
+        """Project the new frames, store them in the rolling K/V cache, and return the full K/V.
+
+        Pure cache I/O: K and V are kept in one tensor (stacked on dim 0) so the cache stays a single
+        tensor and rolls with one cat; the returned K/V are flat (batch, time, size) views and the
+        caller reshapes them into attention heads.
+
+        Args:
+            key, value (torch.Tensor): (batch, time_new, size) new-frame inputs.
+            cache (torch.Tensor): (2, batch, time_cache, size) with cache[0]=K, cache[1]=V.
+        Returns:
+            k, v (torch.Tensor): (batch, time_cache + time_new, size) full K and V (cache + new).
+            cache (torch.Tensor): (2, batch, time_cache_next, size) rolled K/V cache.
+        """
+        t_cache = cache.shape[2]
+        new_kv = torch.stack([self.linear_k(key), self.linear_v(value)], dim=0)  # (2, B, T_new, size)
+        kv = torch.cat([cache, new_kv], dim=2)  # (2, B, T_cache + T_new, size)
+        # The rolled cache (drop oldest, append kept-new) is a contiguous window of kv, so take a view
+        # instead of a second cat: cat([cache[q_keep:], new[:q_keep]]) == kv[:, :, q_keep : q_keep+t_cache].
+        q_keep_size = new_kv.shape[2] - self.cache_drop_size
+        cache = kv[:, :, q_keep_size : q_keep_size + t_cache, :]
+        return kv[0], kv[1], cache
 
 
 class RelPositionMultiHeadAttention(MultiHeadAttention):
@@ -283,14 +312,20 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
             cache (torch.Tensor) : (batch, time_cache_next, size)
         """
-        key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
-
         if torch.is_autocast_enabled():
             query, key, value = query.to(torch.float32), key.to(torch.float32), value.to(torch.float32)
 
         # temporary until we solve this more gracefully
         with avoid_float16_autocast_context():
-            q, k, v = self.forward_qkv(query, key, value)
+            if cache is None:
+                q, k, v = self.forward_qkv(query, key, value)
+            else:
+                # Streaming: reuse cached post-projection K/V; only project the new frames.
+                n_batch = query.size(0)
+                k, v, cache = self.update_cache_kv(key, value, cache)
+                q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                k = k.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                v = v.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
             q = q.transpose(1, 2)  # (batch, time1, head, d_k)
 
             n_batch_pos = pos_emb.size(0)
@@ -416,6 +451,35 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
             self.global_k = nn.Linear(n_feat, n_feat, bias=use_bias)
             self.global_v = nn.Linear(n_feat, n_feat, bias=use_bias)
 
+    def update_cache_kv(self, key, value, cache):
+        """Project new frames, roll the post-projection cache, and return the full flat K/V.
+
+        The cache stacks [K, V] (and [global_K, global_V] when global attention is separate) on dim 0
+        so it stays a single tensor; reshaping to heads is done by the caller. global_k/global_v are
+        None when global attention is not separate.
+
+        Args:
+            key, value (torch.Tensor): (batch, time_new, size) new-frame inputs.
+            cache (torch.Tensor): (slots, batch, time_cache, size) stored projections.
+        Returns:
+            k, v (torch.Tensor): (batch, time_full, size) full local K and V.
+            global_k, global_v (torch.Tensor | None): (batch, time_full, size) full global K and V.
+            cache (torch.Tensor): (slots, batch, time_cache_next, size) rolled cache.
+        """
+        separate_global = self.global_tokens > 0 and self.global_attn_separate
+        t_cache = cache.shape[2]
+        proj = [self.linear_k(key), self.linear_v(value)]
+        if separate_global:
+            proj += [self.global_k(key), self.global_v(value)]
+        new_kv = torch.stack(proj, dim=0)  # (slots, B, T_new, size)
+        kv = torch.cat([cache, new_kv], dim=2)  # (slots, B, T_cache + T_new, size)
+        # rolled cache is a contiguous window of kv -> view instead of a second cat
+        q_keep_size = new_kv.shape[2] - self.cache_drop_size
+        cache = kv[:, :, q_keep_size : q_keep_size + t_cache, :]
+        global_k = kv[2] if separate_global else None
+        global_v = kv[3] if separate_global else None
+        return kv[0], kv[1], global_k, global_v, cache
+
     def forward(self, query, key, value, pad_mask, pos_emb, cache=None):
         """Compute Scaled Dot Product Local Attention with rel. positional encoding. using overlapping chunks
         Args:
@@ -430,14 +494,19 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
             cache (torch.Tensor) : (batch, time_cache_next, size)
         """
 
-        key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
-
         if torch.is_autocast_enabled():
             query, key, value = query.to(torch.float32), key.to(torch.float32), value.to(torch.float32)
 
         # temporary until we solve this more gracefully
         with avoid_float16_autocast_context():
-            q, k, v = self.forward_qkv(query, key, value)
+            if cache is None:
+                q, k, v = self.forward_qkv(query, key, value)
+            else:
+                n_batch = query.size(0)
+                k, v, global_k, global_v, cache = self.update_cache_kv(key, value, cache)
+                q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                k = k.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                v = v.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
             n_batch, _, T, _ = q.size()
 
             w = max(self.att_context_size[0], self.att_context_size[1])
@@ -496,12 +565,13 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
 
                 # create q, k, v for global attn
                 if self.global_attn_separate:
-                    global_q = self.global_q(query).view(n_batch, -1, self.h, self.d_k)
-                    global_k = self.global_k(key).view(n_batch, -1, self.h, self.d_k)
-                    global_v = self.global_v(value).view(n_batch, -1, self.h, self.d_k)
-                    global_q = global_q.transpose(1, 2)
-                    global_k = global_k.transpose(1, 2)
-                    global_v = global_v.transpose(1, 2)
+                    global_q = self.global_q(query)
+                    if cache is None:
+                        global_k = self.global_k(key)
+                        global_v = self.global_v(value)
+                    global_q = global_q.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                    global_k = global_k.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+                    global_v = global_v.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
                     global_q = F.pad(global_q, (0, 0, 0, pad_len))  # (batch, head, time, size)
                     global_k = F.pad(global_k, (0, 0, 0, pad_len))  # (batch, head, time, size)
                     global_v = F.pad(global_v, (0, 0, 0, pad_len))  # (batch, head, time, size)

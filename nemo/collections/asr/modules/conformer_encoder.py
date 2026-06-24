@@ -232,7 +232,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "length": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+                "cache_last_channel": NeuralType(('D', 'D', 'B', 'T', 'D'), ChannelType(), optional=True),
                 "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
                 "bypass_pre_encode": NeuralType(tuple(), BoolType(), optional=True),
@@ -260,7 +260,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             {
                 "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
                 "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+                "cache_last_channel_next": NeuralType(('D', 'D', 'B', 'T', 'D'), ChannelType(), optional=True),
                 "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
             }
@@ -561,7 +561,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if cache_last_channel_next is not None and self.streaming_cfg.last_channel_cache_size >= 0:
             if self.streaming_cfg.last_channel_cache_size > 0:
                 cache_last_channel_next = cache_last_channel_next[
-                    :, :, -self.streaming_cfg.last_channel_cache_size :, :
+                    :, :, :, -self.streaming_cfg.last_channel_cache_size :, :
                 ]
 
         if self.streaming_cfg.valid_out_len > 0 and (not keep_all_outputs or self.att_context_style == "regular"):
@@ -1084,6 +1084,17 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self.streaming_cfg = streaming_cfg
 
+    @property
+    def kv_cache_slots(self):
+        """Number of post-projection tensors stacked in cache_last_channel per layer.
+
+        2 (K, V) for rel_pos / abs_pos; 4 (K, V, global_K, global_V) for Longformer with a
+        separate global-attention projection, since its global K/V need their own cache.
+        """
+        if self.self_attention_model == "rel_pos_local_attn" and self.global_tokens > 0 and self.global_attn_separate:
+            return 4
+        return 2
+
     def get_initial_cache_state(self, batch_size=1, dtype=torch.float32, device=None, max_dim=0):
         if device is None:
             device = next(self.parameters()).device
@@ -1095,6 +1106,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         cache_last_channel = create_tensor(
             (
                 len(self.layers),
+                self.kv_cache_slots,
                 batch_size,
                 self.streaming_cfg.last_channel_cache_size,
                 self.d_model,
@@ -1116,7 +1128,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 dtype=torch.int64,
             )
             for i in range(batch_size):
-                cache_last_channel[:, i, cache_last_channel_len[i] :, :] = 0
+                cache_last_channel[:, :, i, cache_last_channel_len[i] :, :] = 0
                 # what is the right rule to zero out cache_last_time?
                 if cache_last_channel_len[i] == 0:
                     cache_last_time[:, i, :, :] = 0

@@ -1195,7 +1195,7 @@ class SpeakerTaggedASR:
             self.instance_manager.update_asr_state(
                 batch_idx,
                 speaker_id=0,
-                cache_last_channel=cache_last_channel[:, batch_idx],
+                cache_last_channel=cache_last_channel[:, :, batch_idx],  # channel cache: batch dim is 2
                 cache_last_time=cache_last_time[:, batch_idx],
                 cache_last_channel_len=cache_last_channel_len[batch_idx],
                 previous_hypotheses=previous_hypotheses[batch_idx],
@@ -1341,7 +1341,7 @@ class SpeakerTaggedASR:
                 self.instance_manager.update_asr_state(
                     batch_idx,
                     speaker_id,
-                    cache_last_channel[:, active_id],
+                    cache_last_channel[:, :, active_id],  # channel cache: batch dim is 2
                     cache_last_time[:, active_id],
                     cache_last_channel_len[active_id],
                     previous_hypotheses[active_id],
@@ -1465,7 +1465,7 @@ class MultiTalkerInstanceManager:
                 previous_hypothesis (Hypothesis): The previous hypothesis.
                 previous_pred_out (torch.Tensor): The previous prediction output.
             """
-            self.cache_last_channel[:, speaker_id] = cache_last_channel
+            self.cache_last_channel[:, :, speaker_id] = cache_last_channel  # channel cache: speaker dim is 2
             self.cache_last_time[:, speaker_id] = cache_last_time
             self.cache_last_channel_len[speaker_id] = cache_last_channel_len
             self.previous_hypothesis[speaker_id] = previous_hypothesis
@@ -1499,7 +1499,9 @@ class MultiTalkerInstanceManager:
             """
             self.speakers.append(speaker_id)
             cache_last_channel, cache_last_time, cache_last_channel_len = asr_cache_state
-            self.cache_last_channel = torch.cat([self.cache_last_channel, cache_last_channel], dim=1)
+            self.cache_last_channel = torch.cat(
+                [self.cache_last_channel, cache_last_channel], dim=2
+            )
             self.cache_last_time = torch.cat([self.cache_last_time, cache_last_time], dim=1)
             self.cache_last_channel_len = torch.cat([self.cache_last_channel_len, cache_last_channel_len], dim=0)
             self.previous_hypothesis.append(None)
@@ -1887,7 +1889,7 @@ class MultiTalkerInstanceManager:
                 )
                 self._active_asr_pred_out_stream.append(self.batch_asr_states[batch_idx].previous_pred_out[speaker_id])
                 self._active_cache_last_channel.append(
-                    self.batch_asr_states[batch_idx].cache_last_channel[:, speaker_id]
+                    self.batch_asr_states[batch_idx].cache_last_channel[:, :, speaker_id]  # channel: speaker dim is 2
                 )
                 self._active_cache_last_time.append(self.batch_asr_states[batch_idx].cache_last_time[:, speaker_id])
                 self._active_cache_last_channel_len.append(
@@ -1905,7 +1907,7 @@ class MultiTalkerInstanceManager:
         # Update active speaker attributes
         self.active_previous_hypotheses = deepcopy(self._active_previous_hypotheses)
         self.active_asr_pred_out_stream = deepcopy(self._active_asr_pred_out_stream)
-        self.active_cache_last_channel = torch.stack(self._active_cache_last_channel).transpose(0, 1)
+        self.active_cache_last_channel = torch.stack(self._active_cache_last_channel).movedim(0, 2)
         self.active_cache_last_time = torch.stack(self._active_cache_last_time).transpose(0, 1)
         self.active_cache_last_channel_len = torch.stack(self._active_cache_last_channel_len)
         return active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets
