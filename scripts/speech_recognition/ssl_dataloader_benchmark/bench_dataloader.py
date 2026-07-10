@@ -168,6 +168,34 @@ def build_dataloader(args):
     )
 
 
+def build_lhotse_dataloader(args):
+    """Same construction path as EncDecDenoiseMaskedTokenPredModel with use_lhotse=True."""
+    from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+
+    cfg = OmegaConf.create(
+        {
+            "manifest_filepath": args.manifest,
+            "sample_rate": 16000,
+            "batch_size": args.batch_size,
+            "shuffle": True,
+            "num_workers": args.num_workers,
+            "pin_memory": False,
+            "max_duration": 60.0,
+            "min_duration": 1.0,
+            "use_lhotse": True,
+        }
+    )
+    dataset = ssl_dataset.LhotseAudioNoiseDataset(
+        noise_manifest=args.noise_manifest,
+        batch_augmentor_cfg=(
+            None if args.no_augmentor else OmegaConf.create(BATCH_AUGMENTOR_CFG)
+        ),
+    )
+    return get_lhotse_dataloader_from_config(
+        cfg, global_rank=0, world_size=1, dataset=dataset
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
@@ -179,11 +207,23 @@ def main():
     parser.add_argument(
         "--time-cap", type=float, default=90.0, help="max measurement seconds"
     )
+    parser.add_argument(
+        "--min-time",
+        type=float,
+        default=0.0,
+        help="keep measuring until this many seconds elapsed, so the steady-state rate "
+        "dominates over draining the num_workers*prefetch_factor batch queue",
+    )
     parser.add_argument("--no-augmentor", action="store_true")
     parser.add_argument(
         "--patched",
         action="store_true",
         help="apply candidate hotspot fixes before benchmarking",
+    )
+    parser.add_argument(
+        "--lhotse",
+        action="store_true",
+        help="benchmark LhotseAudioNoiseDataset instead",
     )
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
@@ -191,7 +231,7 @@ def main():
     if args.patched:
         apply_patches()
 
-    dl = build_dataloader(args)
+    dl = build_lhotse_dataloader(args) if args.lhotse else build_dataloader(args)
 
     t_start = time.perf_counter()
     it = iter(dl)
@@ -208,8 +248,16 @@ def main():
     audio_secs = 0.0
     t0 = time.perf_counter()
     deadline = t0 + args.time_cap
-    while n_batches < args.measure_batches and time.perf_counter() < deadline:
-        batch = next(it)
+    min_deadline = t0 + args.min_time
+    exhausted = False
+    while (
+        n_batches < args.measure_batches or time.perf_counter() < min_deadline
+    ) and time.perf_counter() < deadline:
+        try:
+            batch = next(it)
+        except StopIteration:
+            exhausted = True
+            break
         n_batches += 1
         n_samples += batch.audio.size(0)
         audio_secs += batch.audio_len.sum().item() / 16000.0
@@ -223,6 +271,8 @@ def main():
         "noise": args.noise_manifest is not None,
         "augmentor": not args.no_augmentor,
         "patched": args.patched,
+        "lhotse": args.lhotse,
+        "exhausted_epoch": exhausted,
         "time_to_first_batch_s": round(ttfb, 3),
         "measured_batches": n_batches,
         "elapsed_s": round(elapsed, 3),

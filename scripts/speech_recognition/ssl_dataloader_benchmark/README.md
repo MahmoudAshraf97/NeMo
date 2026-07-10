@@ -17,12 +17,14 @@ python bench_dataloader.py \
     --noise-manifest data/noise_manifest.json \
     --batch-size 16 --num-workers 4
 
-# 3. full sweep matrix (batch-size sweep, worker sweep, no-noise, silent-noise, patched)
-./run_sweeps.sh    # writes results.jsonl
+# 3. full sweep matrices (batch-size sweep, worker sweep, no-noise, silent-noise, patched)
+./run_sweeps.sh           # map-style AudioNoiseDataset -> results.jsonl
+./run_sweeps_lhotse.sh    # LhotseAudioNoiseDataset    -> results_lhotse.jsonl
 ```
 
-`--patched` applies two candidate fixes via monkeypatching (see below) so the headroom
-can be measured without modifying NeMo.
+`--patched` applies two candidate fixes via monkeypatching so the headroom can be
+measured without modifying NeMo; `--lhotse` benchmarks `LhotseAudioNoiseDataset`
+(`use_lhotse: true` path) instead of the map-style dataset.
 
 ## Findings
 

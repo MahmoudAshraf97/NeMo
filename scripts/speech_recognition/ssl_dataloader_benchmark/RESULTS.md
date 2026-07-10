@@ -2,17 +2,27 @@
 
 Environment: 4-CPU Linux container, no GPU (pure dataloader throughput), warm page cache.
 Data: dummy 16 kHz wavs, durations uniform in [15, 20] s — silent main wavs, zero-mean
-random-noise wavs for the noise manifest (256 main files / 4096 manifest entries / 64 noise files).
-Dataloader: `AudioNoiseDataset` + `MultiSpeakerNoiseAugmentation` (NEST `train_ds` defaults,
-`prob=0.5`, 1 segment / 1 speaker), built via `get_audio_noise_dataset_from_config`.
+random-noise wavs for the noise manifest (256 main files / 16384 manifest entries / 64 noise files).
+Both variants are built through the exact model code paths
+(`EncDecDenoiseMaskedTokenPredModel._setup_dataloader_from_config`):
+
+- **map-style**: `AudioNoiseDataset` + `MultiSpeakerNoiseAugmentation` (NEST `train_ds` defaults)
+- **lhotse**: `LhotseAudioNoiseDataset` via `get_lhotse_dataloader_from_config` (`use_lhotse: true`)
+
+Measurement methodology: after warmup, batches are consumed until BOTH a minimum batch count
+and a minimum wall-time window (40 s baseline / 15 s patched) elapse, so the steady-state
+production rate dominates over draining the `num_workers x prefetch_factor` batch queue.
 
 ## TL;DR
 
-The dataloader is CPU-bound at **~2 samples/s per worker** (~0.45 s per item). Throughput is
-**flat with batch size** — a bigger batch just takes proportionally longer to assemble — and
-scales only linearly with workers, so at moderate batch sizes the GPU starves no matter what.
-Two Python-level hotspots in the noise-sampling path cause ~99% of the cost; fixing both makes
-the same dataloader **~40–60× faster** (390 samples/s at bs=16/nw=4) and no longer the bottleneck.
+Both variants are CPU-bound in the noise-sampling path, not in audio I/O (decoding a 15–20 s
+wav takes ~1.4 ms). The map-style loader saturates at **~2 samples/s per worker**; throughput is
+flat with batch size, so a bigger batch just takes proportionally longer to assemble and the GPU
+starves. The Lhotse variant looks 2–10× faster *on this dummy data* but only because a padding
+artifact masks the main pathology (see below) — on realistic data (noise recordings longer than
+utterances) it degrades to the same behavior. Fixing two Python-level hotspots makes **both**
+variants **~40–60× faster** (~330–420 samples/s), flat across batch sizes, and no longer the
+bottleneck.
 
 ## Root causes (in order of impact)
 
@@ -24,13 +34,13 @@ and retries while `sum(audio_segment.samples) > 0` is false, up to `max_trial=10
 - **`sum()` is the Python builtin over a numpy array** — ~20 ms per call for a 15–20 s clip
   (vs 0.15 ms for the numpy equivalent), i.e. 100× slower than the decode itself (~1.4 ms).
 - **The predicate tests the signed sum, not emptiness.** For zero-mean audio the sign of the
-  sum is a coin flip, and all 100 trial windows of the same file overlap heavily (durations
-  15–20 s vs targets 15–20 s), so their sums are almost perfectly correlated: if the first
-  window sums negative, *all 100 trials fail* and each pays a full decode + 20 ms Python sum.
+  sum is a coin flip, and all 100 trial windows of the same file overlap heavily, so their sums
+  are almost perfectly correlated: if the first window sums negative, *all 100 trials fail* and
+  each pays a full decode + 20 ms Python sum.
 
 Measured per-item latency is bimodal: **~20 ms normally vs ~1.9 s** (101 `AudioSegment.from_file`
 calls) when a noise file draws a negative sum — roughly half the noise files, whenever
-`noise_duration > main_duration`. This is not an artifact of dummy data: any zero-mean real
+`noise_duration > target_length`. This is not an artifact of dummy data: any zero-mean real
 noise corpus behaves the same. The same slow `sum(...) == 0` check also runs once per
 successful load (line 214), putting a ~20 ms floor under every item.
 
@@ -41,66 +51,98 @@ chosen by drawing 160 k Python-level random numbers and counting them: ~16–50 
 item, even with `num_segments=1` where the answer is trivially `[mix_len]`. An
 `np.random.multinomial(mix_len, ...)` draw is distribution-identical and O(num_segments).
 
-For reference, actually decoding a 15–20 s wav costs ~1.4 ms — the real I/O is negligible
-next to these two Python loops.
+## Map-style variant
 
-## Benchmark: batch-size scaling at `num_workers=4`
+### Batch-size scaling at `num_workers=4`
 
-Baseline (noise manifest + augmentor, as in NEST config) vs the same dataloader with the two
-fixes monkeypatched in (`--patched`), and a no-noise-manifest contrast:
+| batch size | baseline s/batch | baseline samples/s | patched s/batch | patched samples/s |
+|-----------:|-----------------:|-------------------:|----------------:|------------------:|
+| 4          | 0.61             | 6.5                | 0.011           | 365               |
+| 8          | 1.19             | 6.8                | 0.020           | 400               |
+| 16         | 1.89             | 8.5                | 0.048           | 331               |
+| 32         | 3.75             | 8.5                | 0.089           | 358               |
+| 64         | 7.15             | 9.0                | 0.178           | 359               |
 
-| batch size | baseline s/batch | baseline samples/s | patched s/batch | patched samples/s | no-noise samples/s |
-|-----------:|-----------------:|-------------------:|----------------:|------------------:|-------------------:|
-| 4          | 0.42             | 9.6                | 0.011           | 352               | 214                |
-| 8          | 0.81             | 9.9                | 0.021           | 391               | —                  |
-| 16         | 1.87             | 8.6                | 0.041           | 388               | 239                |
-| 32         | 5.13             | 6.2                | 0.094           | 341               | —                  |
-| 64         | 7.76             | 8.3                | 0.181           | 354               | 166                |
+No-noise-manifest contrast (zeros noise, augmentor on): 239–277 samples/s — the noise path is
+~30× the cost of everything else combined.
 
-Baseline throughput is **flat at ~6–10 samples/s** regardless of batch size: batch assembly time
-grows linearly (0.42 s → 7.8 s per batch), which is exactly the "gradient accumulation instead of
-bigger batches" symptom — the loader can't fill a big batch any faster than N small ones.
-Time-to-first-batch also balloons (2 s → 32 s). Patched, throughput is ~355–390 samples/s and
-still flat — but at that level a batch of 64 takes 0.18 s to build, comfortably ahead of a
-typical training step.
-
-## Benchmark: worker scaling at `batch_size=16`
+### Worker scaling at `batch_size=16`
 
 | num_workers | baseline s/batch | baseline samples/s | patched s/batch | patched samples/s |
 |------------:|-----------------:|-------------------:|----------------:|------------------:|
-| 0           | 7.47             | 2.1                | 0.067           | 238               |
-| 1           | 7.96             | 2.0                | 0.101           | 158               |
-| 2           | 3.28             | 4.9                | 0.048           | 333               |
-| 4           | 2.08             | 7.7                | 0.041           | 393               |
-| 8           | 1.40             | 11.4               | 0.042           | 385               |
+| 0           | 7.51             | 2.1                | 0.061           | 264               |
+| 1           | 6.82             | 2.4                | 0.090           | 177               |
+| 2           | 4.06             | 3.9                | 0.049           | 326               |
+| 4           | 1.87             | 8.6                | 0.039           | 407               |
+| 8           | 1.68             | 9.5                | 0.040           | 398               |
 
-Baseline scales ~linearly with workers (2.1 → 11.4 samples/s from 1× to 8× on a 4-core box —
-oversubscription helps a little because item cost is bimodal and stragglers dominate). Linear
-scaling from a 2 samples/s-per-worker base is hopeless: feeding a GPU that consumes a bs=32
-batch every ~0.3 s would need ~50 workers. Patched, even `num_workers=0` (238 samples/s) beats
-the baseline with 8 workers by 20×, and scaling saturates at 4 workers because the loader is no
-longer CPU-bound.
+Baseline throughput is flat with batch size and scales only linearly with workers from a
+~2 samples/s-per-worker base (saturating at the 4 physical cores) — feeding a GPU that consumes
+a bs=32 batch every ~0.3 s would need ~50 workers. Patched, even `num_workers=0` (264 samples/s)
+beats the baseline with 8 workers by ~28×, and worker scaling saturates at 4 because the loader
+is no longer CPU-bound.
 
-## The literal "empty wav" case (silent noise files)
+With truly silent noise wavs (the literal "empty wav" case) every item where
+`noise_duration > target` exhausts all 100 trials deterministically, then falls back to
+`WhiteNoisePerturbation`: 3.5 samples/s at bs=8/nw=4.
 
-With truly silent noise wavs, every item where `noise_duration > main_duration` exhausts all
-100 trials deterministically and then falls back to `WhiteNoisePerturbation` (plus a warning
-log per item): 1.51 s/batch at bs=8/nw=4 (5.3 samples/s). Silent stretches in a real noise
-corpus hit the same path.
+## Lhotse variant
+
+### Batch-size scaling at `num_workers=4`
+
+| batch size | baseline s/batch | baseline samples/s | patched s/batch | patched samples/s |
+|-----------:|-----------------:|-------------------:|----------------:|------------------:|
+| 4          | 0.38             | 10.6               | 0.011           | 362               |
+| 8          | 0.48             | 16.6               | 0.020           | 406               |
+| 16         | 0.84             | 19.1               | 0.039           | 406               |
+| 32         | 0.81             | 39.7               | 0.104           | 308               |
+| 64         | 0.73             | 88.0               | 0.209           | 306               |
+
+### Worker scaling at `batch_size=16`
+
+| num_workers | baseline s/batch | baseline samples/s | patched s/batch | patched samples/s |
+|------------:|-----------------:|-------------------:|----------------:|------------------:|
+| 0           | 3.65             | 4.4                | 0.068           | 237               |
+| 1           | 1.54             | 10.4               | 0.090           | 177               |
+| 2           | 1.29             | 12.4               | 0.047           | 340               |
+| 4           | 0.64             | 25.0               | 0.038           | 418               |
+| 8           | 0.67             | 23.9               | 0.040           | 398               |
+
+No-noise contrast: 230–271 samples/s (same as map-style). Silent-noise: 10.0 samples/s at bs=8.
+
+### Why the Lhotse baseline looks faster here — and why it won't be on real data
+
+`LhotseAudioNoiseDataset.__getitem__` calls `AudioSamples` (lhotse `collate_audio`), which
+**pads every cut to the batch max length and returns the padded cuts**. The subsequent
+`sample_noise(..., cut.num_samples)` therefore uses the *batch-max* length as the noise target
+for every item (verified by instrumentation: all noise loads in a batch share the same
+`max_dur`). Hotspot #1's retry loop only triggers when `noise_duration > target`, so with this
+dummy data (noise 15–20 s vs batch max ≈ 19–20 s) only the longest noise files can trigger it —
+and the bigger the batch, the higher the batch max, the rarer the pathology. That is the entire
+reason baseline samples/s *rises* with batch size (10.6 → 88).
+
+On realistic data, noise recordings (often minutes long) exceed any utterance batch max, so
+**every noise draw enters the retry loop** with the ~50% coin-flip failure mode — the Lhotse
+variant then behaves like the map-style one. Its floor is also higher per load (~40–80 ms vs
+~20 ms) because it decodes the *full* noise file before trimming, plus the Python `sum()`.
+Structurally it also assembles the whole batch inside a single `__getitem__` (workers pipeline
+whole batches), which is why patched throughput at bs=32/64 (306–308 samples/s) trails the
+map-style variant (358) — coarser parallelism granularity.
+
+The worker-scaling anomaly at `num_workers=1` (177 samples/s in both variants, patched) is the
+usual IPC/serialization overhead of a single worker vs in-process loading; it disappears at ≥2.
 
 ## Recommended fixes
 
 1. `ssl_dataset.py` — replace both emptiness checks with a numpy energy test, e.g.
    `np.abs(audio_segment.samples).max() > 0` (and `== 0` for the fallback check). This removes
-   the 20 ms/item floor *and* the coin-flip retry storm, since any window with nonzero content
-   passes on the first trial.
+   the 20 ms/item floor *and* the coin-flip retry storm in both dataset variants, since any
+   window with nonzero content passes on the first trial.
 2. `augmentation.py:201` — replace `Counter(random.choices(range(num_segments), k=mix_len))`
    with `np.random.multinomial(mix_len, np.ones(n)/n)` (drop zero counts to keep semantics).
-3. Optional hardening: skip the offset-retry decode loop entirely when the noise file is known
-   non-silent, and rate-limit the "empty noise" warning which does console I/O per item.
+3. Optional hardening: skip the offset-retry decode loop when the noise file is known
+   non-silent; rate-limit the "empty noise" warning (console I/O per item); in the Lhotse
+   variant, consider decoding only the needed noise window instead of the full file.
 
-`LhotseAudioNoiseDataset` shares `sample_noise`/`load_noise_audio` and therefore hotspot #1;
-it additionally loads the *whole batch* inside a single `__getitem__`, so its batch-size
-scaling is structurally worse (workers pipeline whole batches instead of items).
-
-Raw numbers: `results.jsonl` (one JSON object per run, produced by `run_sweeps.sh`).
+Raw numbers: `results.jsonl` (map-style) and `results_lhotse.jsonl` (lhotse), one JSON object
+per run, produced by `run_sweeps.sh` / `run_sweeps_lhotse.sh`.
