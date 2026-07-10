@@ -225,6 +225,13 @@ def main():
         action="store_true",
         help="benchmark LhotseAudioNoiseDataset instead",
     )
+    parser.add_argument(
+        "--sim-gpu-samples-per-s",
+        type=float,
+        default=None,
+        help="simulate a GPU consumer that takes batch_size/RATE seconds of compute per step "
+        "(sleeping, so workers keep the CPUs). Measures per-step wait (GPU stall) directly.",
+    )
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
 
@@ -246,6 +253,8 @@ def main():
     n_batches = 0
     n_samples = 0
     audio_secs = 0.0
+    stalls = []
+    compute_total = 0.0
     t0 = time.perf_counter()
     deadline = t0 + args.time_cap
     min_deadline = t0 + args.min_time
@@ -253,14 +262,21 @@ def main():
     while (
         n_batches < args.measure_batches or time.perf_counter() < min_deadline
     ) and time.perf_counter() < deadline:
+        t_wait = time.perf_counter()
         try:
             batch = next(it)
         except StopIteration:
             exhausted = True
             break
+        stalls.append(time.perf_counter() - t_wait)
         n_batches += 1
-        n_samples += batch.audio.size(0)
+        bs_actual = batch.audio.size(0)
+        n_samples += bs_actual
         audio_secs += batch.audio_len.sum().item() / 16000.0
+        if args.sim_gpu_samples_per_s:
+            step = bs_actual / args.sim_gpu_samples_per_s
+            time.sleep(step)
+            compute_total += step
     elapsed = time.perf_counter() - t0
     del it
 
@@ -281,6 +297,22 @@ def main():
         "samples_per_s": round(n_samples / elapsed, 2),
         "audio_hours_per_s": round(audio_secs / 3600.0 / elapsed, 4),
     }
+    if args.sim_gpu_samples_per_s and stalls:
+        stalls_sorted = sorted(stalls)
+        stall_total = sum(stalls)
+        result.update(
+            {
+                "sim_gpu_samples_per_s": args.sim_gpu_samples_per_s,
+                "stall_mean_ms": round(1000 * stall_total / len(stalls), 1),
+                "stall_p50_ms": round(1000 * stalls_sorted[len(stalls) // 2], 1),
+                "stall_p95_ms": round(1000 * stalls_sorted[int(len(stalls) * 0.95)], 1),
+                "stall_max_ms": round(1000 * stalls_sorted[-1], 1),
+                "stall_fraction": round(stall_total / (stall_total + compute_total), 4),
+                "gpu_utilization": round(
+                    compute_total / (stall_total + compute_total), 4
+                ),
+            }
+        )
     print("RESULT:" + json.dumps(result))
 
 

@@ -132,6 +132,49 @@ map-style variant (358) — coarser parallelism granularity.
 The worker-scaling anomaly at `num_workers=1` (177 samples/s in both variants, patched) is the
 usual IPC/serialization overhead of a single worker vs in-process loading; it disappears at ≥2.
 
+## GPU-visible stall vs batch size (simulated consumer)
+
+Throughput alone hides what the GPU experiences per step, so `--sim-gpu-samples-per-s RATE`
+adds a consumer that sleeps `batch_size/RATE` seconds after each batch (like a training step,
+leaving the CPUs to the workers) and records how long each `next(batch)` blocks — the actual
+GPU idle time, including tails. Setup: **lhotse, no noise manifest, augmentor on** (a common
+NEST configuration), `num_workers=4`.
+
+| GPU rate | bs | baseline stall mean / p95 / max (ms) | baseline GPU util | patched stall mean / p95 / max (ms) | patched GPU util |
+|---------:|---:|-------------------------------------:|------------------:|------------------------------------:|-----------------:|
+| 200/s    | 8  | 14 / 30 / 75                         | 74%               | 12 / 14 / 18                        | 77%              |
+| 200/s    | 16 | 24 / 39 / 157                        | 77%               | 22 / 25 / 33                        | 79%              |
+| 200/s    | 32 | 46 / 72 / 413                        | 78%               | 40 / 46 / 104                       | 80%              |
+| 200/s    | 64 | 124 / 170 / **2454**                 | 72%               | 72 / 89 / 192                       | 82%              |
+| 400/s    | 8  | 21 / 50 / 91                         | 48%               | 13 / 16 / 46                        | 61%              |
+| 400/s    | 16 | 39 / 68 / 239                        | 51%               | 22 / 28 / 39                        | 65%              |
+| 400/s    | 32 | 83 / 174 / 496                       | 49%               | 41 / 52 / 106                       | 66%              |
+| 400/s    | 64 | 156 / 209 / **969**                  | 51%               | 76 / 84 / 252                       | 68%              |
+
+Observations:
+
+1. **Mean stall per step grows ~linearly with batch size** in both versions (~1–2 ms/sample).
+   This is main-process work that sits in the GPU's critical path — chiefly receiving the
+   batch tensors from the worker over IPC (2–3 float32 `[B, T]` tensors, hundreds of MB at
+   bs=64 with 20 s audio). Prefetching cannot hide it because it happens in the consumer
+   process. `return_noise=False` (PR 15589) cuts a third of that payload.
+2. **The stall *fraction* (GPU utilization) is roughly flat with batch size** — larger batches
+   don't reduce average overlap; both the stall and the compute grow together. Gradient
+   accumulation with small micro-batches doesn't change the average rates; what it changes is
+   the *granularity*.
+3. **The tail is where large batches hurt.** Baseline max stall grows superlinearly (75 ms at
+   bs=8 → 2.45 s at bs=64 even with a slow GPU): one worker assembles the whole batch, so a
+   batch containing straggler items (the bimodal noise path, a slow read) becomes a single
+   unhidable multi-second GPU gap, and the fixed-size prefetch queue (num_workers x
+   prefetch_factor batches) drains. The patched loader eliminates the stragglers and with them
+   the tail (max 192 ms at bs=64). This tail behavior — fine at small batch, multi-second
+   freezes at large batch — is exactly the symptom that pushes users toward gradient
+   accumulation.
+
+Caveats: 4-core container, sleep-based consumer, no pin_memory/CUDA H2D overlap; absolute
+numbers shift on real hardware but the structure (linear IPC term + superlinear straggler
+tail) carries over.
+
 ## Recommended fixes
 
 1. `ssl_dataset.py` — replace both emptiness checks with a numpy energy test, e.g.
