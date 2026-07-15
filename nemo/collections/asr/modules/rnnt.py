@@ -1517,6 +1517,22 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     "`fuse_loss_wer` is set, therefore encoder and target lengths " "must be provided as well!"
                 )
 
+            pre_joint_loss = getattr(self.loss, "requires_joint_inputs", False)
+            if pre_joint_loss:
+                loss = None
+                if decoder_outputs is not None:
+                    loss = self.loss.forward_from_joint(
+                        joint=self,
+                        encoder_outputs=encoder_outputs,
+                        predictor_outputs=decoder_outputs,
+                        targets=transcripts,
+                        input_lengths=encoder_lengths,
+                        target_lengths=transcript_lengths,
+                    )
+                if not compute_wer:
+                    return loss, None, None, None
+                decoder_outputs = None
+
             losses = []
             wers, wer_nums, wer_denoms = [], [], []
             target_lengths = []
@@ -1626,6 +1642,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             # Reduce over sub batches
             if losses is not None:
                 losses = self.loss.reduce(losses, target_lengths)
+            if pre_joint_loss:
+                losses = loss
 
             # Collect sub batch wer results
             if compute_wer:

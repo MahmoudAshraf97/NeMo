@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from nemo.collections.asr.losses.pruned_rnnt import PrunedRNNTLoss
 from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
@@ -137,6 +138,12 @@ RNNT_LOSS_RESOLVER = {
         lib_name="k2",
         is_available=K2_AVAILABLE,
         installation_msg=K2_INSTALLATION_MESSAGE,
+        force_float32=False,
+    ),
+    "pruned_rnnt": RNNTLossConfig(
+        loss_name="pruned_rnnt",
+        lib_name="torch",
+        is_available=True,
         force_float32=False,
     ),
     "tdt": RNNTLossConfig(
@@ -322,6 +329,9 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
     elif loss_name == "graph_w_transducer":
         loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, GraphWTransducerLoss.__init__, ignore_params={"blank"})
         loss_func = GraphWTransducerLoss(blank=blank_idx, **loss_kwargs)
+    elif loss_name == "pruned_rnnt":
+        loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, PrunedRNNTLoss.__init__, ignore_params={"blank"})
+        loss_func = PrunedRNNTLoss(blank=blank_idx, **loss_kwargs)
     else:
         raise ValueError(
             f"Invalid value of `loss_name`: {loss_name}. Allowed loss names are :" f"{loss_function_names}"
@@ -418,6 +428,39 @@ class RNNTLoss(Loss):
         self._force_float32 = RNNT_LOSS_RESOLVER[loss_name].force_float32
         self._fp16_compat_checked = False
 
+    @property
+    def requires_joint_inputs(self) -> bool:
+        return bool(getattr(self._loss, "requires_joint_inputs", False))
+
+    def bind_joint(self, joint: torch.nn.Module) -> None:
+        self._loss.bind_joint(joint)
+
+    def set_step(self, global_step: int) -> None:
+        self._loss.set_step(global_step)
+
+    @property
+    def diagnostics(self) -> Dict[str, torch.Tensor]:
+        return getattr(self._loss, "diagnostics", {})
+
+    def forward_from_joint(
+        self,
+        joint: torch.nn.Module,
+        encoder_outputs: torch.Tensor,
+        predictor_outputs: torch.Tensor,
+        targets: torch.Tensor,
+        input_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        losses = self._loss.forward_from_joint(
+            joint=joint,
+            encoder_outputs=encoder_outputs,
+            predictor_outputs=predictor_outputs,
+            targets=targets,
+            source_lengths=input_lengths,
+            target_lengths=target_lengths,
+        )
+        return self.reduce(losses, target_lengths) if self.reduction is not None else losses
+
     def reduce(self, losses, target_lengths):
 
         if isinstance(losses, List):
@@ -437,6 +480,8 @@ class RNNTLoss(Loss):
 
     @typecheck()
     def forward(self, log_probs, targets, input_lengths, target_lengths):
+        if self.requires_joint_inputs:
+            return self._loss()
         # Cast to int 64
         targets = targets.long()
         input_lengths = input_lengths.long()

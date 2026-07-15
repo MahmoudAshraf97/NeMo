@@ -93,6 +93,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
         )
+        if self.loss.requires_joint_inputs:
+            self.loss.bind_joint(self.joint)
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
@@ -740,6 +742,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             log_every_n_steps = 1
             sample_id = batch_nb
+        if self.loss.requires_joint_inputs:
+            self.loss.set_step(sample_id)
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
@@ -805,6 +809,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
+
+        if self.loss.requires_joint_inputs:
+            tensorboard_logs.update({f"train_pruned_rnnt_{k}": v for k, v in self.loss.diagnostics.items()})
 
         # Log items
         self.log_dict(tensorboard_logs)
