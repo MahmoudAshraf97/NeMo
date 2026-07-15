@@ -22,9 +22,10 @@ import torch
 
 from nemo.collections.asr.parts.pruned_rnnt import (
     MAX_TARGET_TOKENS,
+    _gather_predictor,
+    _pruned_logprobs_triton,
     get_prune_ranges,
     get_smoothed_rnnt_logprobs,
-    pruned_logprobs_triton,
     rnnt_loss_triton,
 )
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
@@ -272,28 +273,20 @@ class PrunedRNNTLoss(torch.nn.Module):
 
         projected_encoder = joint.project_encoder(encoder_outputs)
         projected_predictor = joint.project_prednet(predictor_outputs)
-        prune_range = ranges.shape[2]
-        hidden = projected_predictor.shape[2]
-        gathered_predictor = torch.gather(
-            projected_predictor,
-            dim=1,
-            index=ranges.reshape(batch, max_source * prune_range, 1).expand(
-                batch, max_source * prune_range, hidden
-            ),
-        ).reshape(batch, max_source, prune_range, hidden)
+        gathered_predictor = _gather_predictor(projected_predictor, ranges)
         joint_input = projected_encoder.unsqueeze(2) + gathered_predictor
         if joint.is_adapter_available():
             joint_input = joint.forward_enabled_adapters(joint_input)
         pruned_logits = joint.joint_net(joint_input)
-        if joint.log_softmax:
-            pruned_logits = (pruned_logits / joint.temperature).log_softmax(dim=-1)
-        pruned_target, pruned_blank = pruned_logprobs_triton(
+        logit_scale = 1.0 / joint.temperature if joint.log_softmax else 1.0
+        pruned_target, pruned_blank = _pruned_logprobs_triton(
             pruned_logits,
             ranges,
             targets,
             self.blank,
             source_lengths,
             target_lengths,
+            logit_scale,
         )
         pruned_loss, _, _ = rnnt_loss_triton(
             pruned_target, pruned_blank, source_lengths, target_lengths

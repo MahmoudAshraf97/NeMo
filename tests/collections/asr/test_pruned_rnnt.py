@@ -20,9 +20,10 @@ from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.modules.rnnt import RNNTJoint
 from nemo.collections.asr.parts.pruned_rnnt import (
     MAX_TARGET_TOKENS,
+    _gather_predictor,
+    _pruned_logprobs_triton,
     get_prune_ranges,
     get_smoothed_rnnt_logprobs,
-    pruned_logprobs_triton,
     rnnt_loss_triton,
 )
 from nemo.collections.common.parts import adapter_modules
@@ -153,6 +154,27 @@ def test_smoothed_scores_match_dense_simple_joiner():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(("lm_only_scale", "am_only_scale"), [(0.25, 0.0), (0.0, 0.25)])
+def test_smoothed_scores_support_all_blank_batch(lm_only_scale, am_only_scale):
+    torch.manual_seed(1)
+    batch, source, vocab = 2, 5, 7
+    am = torch.randn(batch, source, vocab, requires_grad=True)
+    lm = torch.randn(batch, 1, vocab, requires_grad=True)
+    labels = torch.empty((batch, 0), dtype=torch.long)
+
+    target_scores, blank_scores = get_smoothed_rnnt_logprobs(
+        lm, am, labels, vocab - 1, lm_only_scale, am_only_scale
+    )
+    blank_scores.sum().backward()
+
+    assert target_scores.shape == (batch, source, 0)
+    assert blank_scores.shape == (batch, source, 1)
+    assert torch.isfinite(blank_scores).all()
+    assert torch.isfinite(am.grad).all()
+    assert torch.isfinite(lm.grad).all()
+
+
+@pytest.mark.unit
 def test_torch_recursion_gradients_and_blank_only():
     torch.manual_seed(1)
     target_scores = torch.randn(3, 6, 4, requires_grad=True)
@@ -202,6 +224,37 @@ def test_pruning_ranges_obey_constraints():
     assert torch.all(ranges[..., 1:] == ranges[..., :-1] + 1)
     assert starts[0, 0] == 0
     assert starts[0, source_lengths[0] - 1] == target_lengths[0] - ranges.shape[-1] + 1
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(
+    not (TRITON_AVAILABLE and torch.cuda.is_available()),
+    reason="CUDA and Triton are required",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_predictor_gather_forward_and_backward(dtype):
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("The CUDA device does not support BF16")
+    device = torch.device("cuda")
+    starts = torch.tensor([[0, 0, 1, 1, 2, 3, 4], [0, 1, 1, 2, 2, 3, 4]], device=device)
+    ranges = starts.unsqueeze(2) + torch.arange(3, device=device).reshape(1, 1, 3)
+    predictor = torch.randn(2, 7, 17, device=device, dtype=dtype, requires_grad=True)
+    reference_predictor = predictor.detach().clone().requires_grad_(True)
+    weight = torch.randn(2, 7, 3, 17, device=device)
+
+    actual = _gather_predictor(predictor, ranges)
+    index = ranges.reshape(2, 21, 1).expand(2, 21, 17)
+    expected = torch.gather(reference_predictor, 1, index).reshape(2, 7, 3, 17)
+    actual_grad = torch.autograd.grad((actual.float() * weight).sum(), predictor)[0]
+    expected_grad = torch.autograd.grad(
+        (expected.float() * weight).sum(), reference_predictor
+    )[0]
+
+    assert torch.equal(actual, expected)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    assert torch.allclose(
+        actual_grad.float(), expected_grad.float(), atol=tolerance, rtol=tolerance
+    )
 
 
 @pytest.mark.unit
@@ -491,6 +544,25 @@ def test_triton_recursion_forward_and_gradient_parity(max_target):
     not (TRITON_AVAILABLE and torch.cuda.is_available()),
     reason="CUDA and Triton are required",
 )
+def test_triton_recursion_masks_invalid_cuda_lengths():
+    device = torch.device("cuda")
+    target_scores = torch.randn(2, 4, 3, device=device)
+    blank_scores = torch.randn(2, 4, 4, device=device)
+    invalid_source_lengths = torch.tensor([0, 6], device=device)
+    invalid_target_lengths = torch.tensor([-1, 5], device=device)
+    losses, target_occupation, blank_occupation = rnnt_loss_triton(
+        target_scores, blank_scores, invalid_source_lengths, invalid_target_lengths
+    )
+    assert torch.isinf(losses).all()
+    assert torch.count_nonzero(target_occupation) == 0
+    assert torch.count_nonzero(blank_occupation) == 0
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(
+    not (TRITON_AVAILABLE and torch.cuda.is_available()),
+    reason="CUDA and Triton are required",
+)
 @pytest.mark.parametrize("blank_id", [0, 8])
 def test_unpruned_range_matches_dense_loss_and_gradients(blank_id):
     torch.manual_seed(7)
@@ -511,7 +583,7 @@ def test_unpruned_range_matches_dense_loss_and_gradients(blank_id):
         .expand(batch, source, -1)
     )
 
-    actual_target, actual_blank = pruned_logprobs_triton(
+    actual_target, actual_blank = _pruned_logprobs_triton(
         logits, ranges, labels, blank_id, source_lengths, target_lengths
     )
     actual, _, _ = rnnt_loss_triton(
@@ -539,11 +611,14 @@ def test_unpruned_range_matches_dense_loss_and_gradients(blank_id):
     not (TRITON_AVAILABLE and torch.cuda.is_available()),
     reason="CUDA and Triton are required",
 )
-def test_unpruned_full_loss_matches_dense_joint_and_gradients():
+@pytest.mark.parametrize(("log_softmax", "temperature"), [(None, 1.0), (True, 1.7)])
+def test_unpruned_full_loss_matches_dense_joint_and_gradients(log_softmax, temperature):
     torch.manual_seed(12)
     device = torch.device("cuda")
     batch, source, target, vocab = 2, 6, 4, 9
     joint = _make_joint(vocab_size=vocab).to(device).train()
+    joint.log_softmax = log_softmax
+    joint.temperature = temperature
     loss = RNNTLoss(
         num_classes=vocab - 1,
         reduction=None,
@@ -619,7 +694,7 @@ def test_reduced_joint_mixed_precision_parity(dtype):
     fp32_logits = torch.randn(
         batch, source, target + 1, vocab, device=device, requires_grad=True
     )
-    fp32_target, fp32_blank = pruned_logprobs_triton(
+    fp32_target, fp32_blank = _pruned_logprobs_triton(
         fp32_logits, ranges, labels, vocab - 1, source_lengths, target_lengths
     )
     fp32_loss, _, _ = rnnt_loss_triton(
@@ -628,7 +703,7 @@ def test_reduced_joint_mixed_precision_parity(dtype):
     fp32_grad = torch.autograd.grad(fp32_loss.sum(), fp32_logits)[0]
 
     mixed_logits = fp32_logits.detach().to(dtype).requires_grad_(True)
-    mixed_target, mixed_blank = pruned_logprobs_triton(
+    mixed_target, mixed_blank = _pruned_logprobs_triton(
         mixed_logits, ranges, labels, vocab - 1, source_lengths, target_lengths
     )
     mixed_loss, _, _ = rnnt_loss_triton(
@@ -699,9 +774,10 @@ def test_fused_joint_bf16_backward_and_diagnostics():
     reason="k2, CUDA, and Triton are required",
 )
 @pytest.mark.parametrize(
-    ("batch", "source", "target", "vocab"), [(2, 9, 5, 11), (3, 257, 129, 67)]
+    ("batch", "source", "target", "vocab", "lm_scale", "am_scale"),
+    [(2, 9, 5, 11, 0.25, 0.0), (2, 9, 5, 11, 0.0, 0.25), (3, 257, 129, 67, 0.25, 0.0)],
 )
-def test_pruning_ranges_match_k2(batch, source, target, vocab):
+def test_pruning_ranges_match_k2(batch, source, target, vocab, lm_scale, am_scale):
     import k2
 
     torch.manual_seed(5)
@@ -721,7 +797,7 @@ def test_pruning_ranges_match_k2(batch, source, target, vocab):
         dim=1,
     )
     target_scores, blank_scores = get_smoothed_rnnt_logprobs(
-        lm, am, labels, vocab - 1, 0.25, 0.0
+        lm, am, labels, vocab - 1, lm_scale, am_scale
     )
     _, target_occupation, blank_occupation = rnnt_loss_triton(
         target_scores, blank_scores, source_lengths, target_lengths
@@ -738,8 +814,8 @@ def test_pruning_ranges_match_k2(batch, source, target, vocab):
         am,
         labels,
         vocab - 1,
-        lm_only_scale=0.25,
-        am_only_scale=0.0,
+        lm_only_scale=lm_scale,
+        am_only_scale=am_scale,
         boundary=boundary,
         reduction="none",
         return_grad=True,
@@ -841,7 +917,7 @@ def test_fp32_loss_and_gradient_parity_with_k2(
         batch, source, prune_range, vocab, device=device, requires_grad=True
     )
     reference_logits = native_logits.detach().clone().requires_grad_(True)
-    pruned_target, pruned_blank = pruned_logprobs_triton(
+    pruned_target, pruned_blank = _pruned_logprobs_triton(
         native_logits, ranges, labels, vocab - 1, source_lengths, target_lengths
     )
     native_pruned, _, _ = rnnt_loss_triton(

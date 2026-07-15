@@ -107,12 +107,18 @@ if TRITON_AVAILABLE:
         batch_idx = tl.program_id(0)
         source_len = tl.load(source_lengths_ptr + batch_idx)
         target_len = tl.load(target_lengths_ptr + batch_idx)
+        valid_lengths = (
+            (source_len >= 1)
+            & (source_len <= max_source)
+            & (target_len >= 0)
+            & (target_len <= max_target)
+        )
         symbols = tl.arange(0, block_target)
-        valid_symbol = symbols <= target_len
+        valid_symbol = valid_lengths & (symbols <= target_len)
         previous = tl.where(symbols == 0, 0.0, -float("inf"))
 
         for time_idx in tl.range(0, max_source):
-            active_time = time_idx < source_len
+            active_time = valid_lengths & (time_idx < source_len)
             blank_offset = (batch_idx * max_source + time_idx - 1) * (
                 max_target + 1
             ) + symbols
@@ -148,19 +154,23 @@ if TRITON_AVAILABLE:
         final_blank_offset = (batch_idx * max_source + source_len - 1) * (
             max_target + 1
         ) + target_len
-        final_blank = tl.load(blank_scores_ptr + final_blank_offset)
+        final_blank = tl.load(
+            blank_scores_ptr + final_blank_offset,
+            mask=valid_lengths,
+            other=-float("inf"),
+        )
         log_likelihood = final_alpha + final_blank
         tl.store(losses_ptr + batch_idx, -log_likelihood)
         tl.debug_barrier()
 
         reverse_idx = tl.arange(0, block_target)
         symbols = max_target - reverse_idx
-        valid_symbol = (symbols >= 0) & (symbols <= target_len)
+        valid_symbol = valid_lengths & (symbols >= 0) & (symbols <= target_len)
         beta_next = tl.full((block_target,), -float("inf"), tl.float32)
 
         for reverse_time in tl.range(0, max_source):
             time_idx = max_source - reverse_time - 1
-            active_time = time_idx < source_len
+            active_time = valid_lengths & (time_idx < source_len)
             blank_offset = (batch_idx * max_source + time_idx) * (
                 max_target + 1
             ) + symbols
@@ -230,7 +240,13 @@ if TRITON_AVAILABLE:
         symbols = tl.arange(0, block_target)
         source_len = tl.load(source_lengths_ptr + batch_idx)
         target_len = tl.load(target_lengths_ptr + batch_idx)
-        valid = (time_idx < source_len) & (symbols < target_len)
+        valid_lengths = (
+            (source_len >= 1)
+            & (source_len <= max_source)
+            & (target_len >= 0)
+            & (target_len <= max_target)
+        )
+        valid = valid_lengths & (time_idx < source_len) & (symbols < target_len)
         alpha_offset = (batch_idx * max_source + time_idx) * (max_target + 1) + symbols
         target_offset = (batch_idx * max_source + time_idx) * max_target + symbols
         alpha = tl.load(alpha_ptr + alpha_offset, mask=valid, other=-float("inf"))
@@ -370,63 +386,64 @@ def get_smoothed_rnnt_logprobs(
     normalizers = torch.bmm(lm_probs, am_probs.transpose(1, 2)).clamp_min(tiny).log()
     normalizers = normalizers + lm_max + am_max.transpose(1, 2)
 
-    lm_only_normalizers = lm_probs.sum(dim=2, keepdim=True)
-    unigram_lm = (
-        (lm_probs / lm_only_normalizers).mean(dim=(0, 1), keepdim=True).clamp_min(tiny)
-    )
-    am_only_normalizers = (
-        torch.mv(am_probs.reshape(-1, vocab), unigram_lm.reshape(vocab))
-        .reshape(batch, max_source, 1)
-        .log()
-        + am_max
-    ).transpose(1, 2)
-    log_unigram_lm = unigram_lm.log()
-    lm_only_normalizers = lm_only_normalizers.log() + lm_max
+    lm_prob_sums = None
+    if lm_only_scale != 0.0 or am_only_scale != 0.0:
+        lm_prob_sums = lm_probs.sum(dim=2, keepdim=True)
+    if lm_only_scale != 0.0:
+        lm_only_normalizers = lm_prob_sums.log() + lm_max
+    if am_only_scale != 0.0:
+        unigram_lm = (
+            (lm_probs / lm_prob_sums).mean(dim=(0, 1), keepdim=True).clamp_min(tiny)
+        )
+        am_only_normalizers = (
+            torch.mv(am_probs.reshape(-1, vocab), unigram_lm.reshape(vocab))
+            .reshape(batch, max_source, 1)
+            .log()
+            + am_max
+        ).transpose(1, 2)
+        log_unigram_lm = unigram_lm.log()
 
-    if max_target:
-        target_index_am = targets.unsqueeze(2).expand(batch, max_target, max_source)
-        target_am = torch.gather(
-            am.transpose(1, 2), dim=1, index=target_index_am
-        ).transpose(1, 2)
-        target_lm = torch.gather(
-            lm[:, :max_target], dim=2, index=targets.unsqueeze(-1)
-        ).transpose(1, 2)
+    target_index_am = targets.unsqueeze(2).expand(batch, max_target, max_source)
+    target_am = torch.gather(
+        am.transpose(1, 2), dim=1, index=target_index_am
+    ).transpose(1, 2)
+    target_lm = torch.gather(
+        lm[:, :max_target], dim=2, index=targets.unsqueeze(-1)
+    ).transpose(1, 2)
+    target_combined = (
+        target_am + target_lm - normalizers[:, :max_target].transpose(1, 2)
+    )
+    if lm_only_scale != 0.0:
+        target_lm_only = target_lm - lm_only_normalizers[:, :max_target].transpose(1, 2)
+    if am_only_scale != 0.0:
         target_lm_unigram = torch.gather(
             log_unigram_lm.expand(batch, max_target, vocab),
             dim=2,
             index=targets.unsqueeze(-1),
         ).transpose(1, 2)
-        target_combined = (
-            target_am + target_lm - normalizers[:, :max_target].transpose(1, 2)
-        )
-        target_lm_only = target_lm - lm_only_normalizers[:, :max_target].transpose(1, 2)
         target_am_only = (
             target_am + target_lm_unigram - am_only_normalizers.transpose(1, 2)
         )
-    else:
-        target_combined = am.new_empty((batch, max_source, 0))
-        target_lm_only = target_combined
-        target_am_only = target_combined
 
     blank_am = am[:, :, blank_id].unsqueeze(1)
     blank_lm = lm[:, :, blank_id].unsqueeze(2)
     blank_combined = (blank_am + blank_lm - normalizers).transpose(1, 2)
-    blank_lm_only = (blank_lm - lm_only_normalizers).transpose(1, 2)
-    blank_am_only = (
-        blank_am + log_unigram_lm[0, 0, blank_id] - am_only_normalizers
-    ).transpose(1, 2)
+    if lm_only_scale != 0.0:
+        blank_lm_only = (blank_lm - lm_only_normalizers).transpose(1, 2)
+    if am_only_scale != 0.0:
+        blank_am_only = (
+            blank_am + log_unigram_lm[0, 0, blank_id] - am_only_normalizers
+        ).transpose(1, 2)
 
     combined_scale = 1.0 - lm_only_scale - am_only_scale
-    target_scores = (
-        combined_scale * target_combined
-        + lm_only_scale * target_lm_only
-        + am_only_scale * target_am_only
-    )
-    blank_scores = (
-        combined_scale * blank_combined
-        + lm_only_scale * blank_lm_only
-        + am_only_scale * blank_am_only
-    )
+    target_scores = combined_scale * target_combined
+    blank_scores = combined_scale * blank_combined
+    if lm_only_scale != 0.0:
+        target_scores = target_scores + lm_only_scale * target_lm_only
+        blank_scores = blank_scores + lm_only_scale * blank_lm_only
+    if am_only_scale != 0.0:
+        target_scores = target_scores + am_only_scale * target_am_only
+        blank_scores = blank_scores + am_only_scale * blank_am_only
     return target_scores.contiguous(), blank_scores.contiguous()
 
 
@@ -479,6 +496,122 @@ def get_prune_ranges(
 if TRITON_AVAILABLE:
 
     @triton.jit
+    def _predictor_gather_segmented_bwd_kernel(
+        grad_output_ptr,
+        ranges_ptr,
+        grad_predictor_ptr,
+        max_source,
+        predictor_length,
+        hidden,
+        prune_range: tl.constexpr,
+        search_steps: tl.constexpr,
+        block_hidden: tl.constexpr,
+    ):
+        batch_idx = tl.program_id(0).to(tl.int64)
+        symbol_idx = tl.program_id(1)
+        hidden_idx = tl.program_id(2) * block_hidden + tl.arange(0, block_hidden)
+        hidden_mask = hidden_idx < hidden
+
+        first_start = symbol_idx - prune_range + 1
+        low = 0
+        high = max_source
+        for _ in tl.static_range(search_steps):
+            active = low < high
+            midpoint = (low + high) // 2
+            start = tl.load(
+                ranges_ptr + (batch_idx * max_source + midpoint) * prune_range,
+                mask=active & (midpoint < max_source),
+                other=0,
+            )
+            move_left = active & (start >= first_start)
+            high = tl.where(move_left, midpoint, high)
+            low = tl.where(active & ~move_left, midpoint + 1, low)
+        first_time = low
+
+        low = first_time
+        high = max_source
+        for _ in tl.static_range(search_steps):
+            active = low < high
+            midpoint = (low + high) // 2
+            start = tl.load(
+                ranges_ptr + (batch_idx * max_source + midpoint) * prune_range,
+                mask=active & (midpoint < max_source),
+                other=0,
+            )
+            move_left = active & (start > symbol_idx)
+            high = tl.where(move_left, midpoint, high)
+            low = tl.where(active & ~move_left, midpoint + 1, low)
+        last_time = low
+
+        accumulated = tl.zeros((block_hidden,), tl.float32)
+        for time_idx in tl.range(first_time, last_time):
+            range_offset = (batch_idx * max_source + time_idx) * prune_range
+            start = tl.load(ranges_ptr + range_offset)
+            prune_idx = symbol_idx - start
+            valid = (prune_idx >= 0) & (prune_idx < prune_range)
+            gathered_row = range_offset + prune_idx
+            accumulated += tl.load(
+                grad_output_ptr + gathered_row * hidden + hidden_idx,
+                mask=valid & hidden_mask,
+                other=0.0,
+            ).to(tl.float32)
+
+        output_offset = (
+            batch_idx * predictor_length + symbol_idx
+        ) * hidden + hidden_idx
+        tl.store(grad_predictor_ptr + output_offset, accumulated, mask=hidden_mask)
+
+
+class _PredictorGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, predictor, ranges):
+        batch, max_source, prune_range = ranges.shape
+        predictor_length, hidden = predictor.shape[1:]
+        gathered = torch.gather(
+            predictor,
+            dim=1,
+            index=ranges.reshape(batch, max_source * prune_range, 1).expand(
+                batch, max_source * prune_range, hidden
+            ),
+        ).reshape(batch, max_source, prune_range, hidden)
+        ctx.save_for_backward(ranges)
+        ctx.predictor_shape = predictor.shape
+        return gathered
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (ranges,) = ctx.saved_tensors
+        batch, max_source, prune_range = ranges.shape
+        _, predictor_length, hidden = ctx.predictor_shape
+        block_hidden = 128
+        grad_output = grad_output.contiguous()
+        grad_predictor = torch.empty(
+            ctx.predictor_shape, dtype=grad_output.dtype, device=grad_output.device
+        )
+        _predictor_gather_segmented_bwd_kernel[
+            (batch, predictor_length, triton.cdiv(hidden, block_hidden))
+        ](
+            grad_output,
+            ranges,
+            grad_predictor,
+            max_source,
+            predictor_length,
+            hidden,
+            prune_range=prune_range,
+            search_steps=max(1, max_source.bit_length()),
+            block_hidden=block_hidden,
+        )
+        return grad_predictor, None
+
+
+def _gather_predictor(predictor: torch.Tensor, ranges: torch.Tensor) -> torch.Tensor:
+    """Gather predictor windows with a collision-free backward."""
+    return _PredictorGather.apply(predictor, ranges)
+
+
+if TRITON_AVAILABLE:
+
+    @triton.jit
     def _pruned_logprobs_fwd_kernel(
         logits_ptr,
         ranges_ptr,
@@ -489,12 +622,13 @@ if TRITON_AVAILABLE:
         blank_scores_ptr,
         max_source,
         max_target,
+        logit_scale,
         prune_range: tl.constexpr,
         vocab_size: tl.constexpr,
         blank_id: tl.constexpr,
         block_vocab: tl.constexpr,
     ):
-        batch_idx = tl.program_id(0)
+        batch_idx = tl.program_id(0).to(tl.int64)
         time_idx = tl.program_id(1)
         prune_idx = tl.program_id(2)
         source_len = tl.load(source_lengths_ptr + batch_idx)
@@ -507,20 +641,28 @@ if TRITON_AVAILABLE:
         logits_offset = range_offset * vocab_size
         vocab_idx = tl.arange(0, block_vocab)
         vocab_mask = vocab_idx < vocab_size
-        logits = tl.load(
-            logits_ptr + logits_offset + vocab_idx, mask=vocab_mask, other=-float("inf")
-        ).to(tl.float32)
+        logits = (
+            tl.load(
+                logits_ptr + logits_offset + vocab_idx,
+                mask=vocab_mask,
+                other=-float("inf"),
+            ).to(tl.float32)
+            * logit_scale
+        )
         maximum = tl.max(logits, axis=0)
         denominator = tl.log(tl.sum(tl.exp(logits - maximum), axis=0)) + maximum
-        blank_logit = tl.load(logits_ptr + logits_offset + blank_id).to(tl.float32)
+        blank_logit = (
+            tl.load(logits_ptr + logits_offset + blank_id).to(tl.float32) * logit_scale
+        )
         score_offset = (batch_idx * max_source + time_idx) * (
             max_target + 1
         ) + symbol_idx
         tl.store(blank_scores_ptr + score_offset, blank_logit - denominator)
         if symbol_idx < target_len:
             target_id = tl.load(targets_ptr + batch_idx * max_target + symbol_idx)
-            target_logit = tl.load(logits_ptr + logits_offset + target_id).to(
-                tl.float32
+            target_logit = (
+                tl.load(logits_ptr + logits_offset + target_id).to(tl.float32)
+                * logit_scale
             )
             target_offset = (
                 batch_idx * max_source + time_idx
@@ -539,12 +681,13 @@ if TRITON_AVAILABLE:
         grad_blank_scores_ptr,
         max_source,
         max_target,
+        logit_scale,
         prune_range: tl.constexpr,
         vocab_size: tl.constexpr,
         blank_id: tl.constexpr,
         block_vocab: tl.constexpr,
     ):
-        batch_idx = tl.program_id(0)
+        batch_idx = tl.program_id(0).to(tl.int64)
         time_idx = tl.program_id(1)
         prune_idx = tl.program_id(2)
         source_len = tl.load(source_lengths_ptr + batch_idx)
@@ -557,9 +700,14 @@ if TRITON_AVAILABLE:
         logits_offset = range_offset * vocab_size
         vocab_idx = tl.arange(0, block_vocab)
         vocab_mask = vocab_idx < vocab_size
-        logits = tl.load(
-            logits_ptr + logits_offset + vocab_idx, mask=vocab_mask, other=-float("inf")
-        ).to(tl.float32)
+        logits = (
+            tl.load(
+                logits_ptr + logits_offset + vocab_idx,
+                mask=vocab_mask,
+                other=-float("inf"),
+            ).to(tl.float32)
+            * logit_scale
+        )
         maximum = tl.max(logits, axis=0)
         softmax = tl.exp(logits - maximum)
         softmax = softmax / tl.sum(softmax, axis=0)
@@ -580,12 +728,22 @@ if TRITON_AVAILABLE:
         grad = -softmax * (blank_grad + target_grad)
         grad += tl.where(vocab_idx == blank_id, blank_grad, 0.0)
         grad += tl.where(vocab_idx == target_id, target_grad, 0.0)
+        grad *= logit_scale
         tl.store(grad_logits_ptr + logits_offset + vocab_idx, grad, mask=vocab_mask)
 
 
 class _PrunedLogProbs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, ranges, targets, blank_id, source_lengths, target_lengths):
+    def forward(
+        ctx,
+        logits,
+        ranges,
+        targets,
+        blank_id,
+        source_lengths,
+        target_lengths,
+        logit_scale,
+    ):
         if not TRITON_AVAILABLE or not logits.is_cuda:
             raise RuntimeError(
                 "Native pruned RNN-T log-probabilities require Triton and CUDA"
@@ -623,6 +781,7 @@ class _PrunedLogProbs(torch.autograd.Function):
             blank_scores,
             max_source=max_source,
             max_target=max_target,
+            logit_scale=logit_scale,
             prune_range=prune_range,
             vocab_size=vocab_size,
             blank_id=blank_id,
@@ -630,6 +789,7 @@ class _PrunedLogProbs(torch.autograd.Function):
         )
         ctx.save_for_backward(logits, ranges, targets, source_lengths, target_lengths)
         ctx.blank_id = blank_id
+        ctx.logit_scale = logit_scale
         return target_scores, blank_scores
 
     @staticmethod
@@ -649,23 +809,29 @@ class _PrunedLogProbs(torch.autograd.Function):
             grad_blank_scores.contiguous(),
             max_source=max_source,
             max_target=max_target,
+            logit_scale=ctx.logit_scale,
             prune_range=prune_range,
             vocab_size=vocab_size,
             blank_id=ctx.blank_id,
             block_vocab=triton.next_power_of_2(vocab_size),
         )
-        return grad_logits, None, None, None, None, None
+        return grad_logits, None, None, None, None, None, None
 
 
-def pruned_logprobs_triton(
+def _pruned_logprobs_triton(
     logits: torch.Tensor,
     ranges: torch.Tensor,
     targets: torch.Tensor,
     blank_id: int,
     source_lengths: torch.Tensor,
     target_lengths: torch.Tensor,
+    logit_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract reduced-joint target and blank scores with softmax recomputation."""
+    """Extract scores for ranges produced by :func:`get_prune_ranges`.
+
+    This internal primitive requires ``ranges`` to match ``logits.shape[:3]``
+    and contain strictly increasing alignment-state indices in ``[0, U]``.
+    """
     return _PrunedLogProbs.apply(
-        logits, ranges, targets, blank_id, source_lengths, target_lengths
+        logits, ranges, targets, blank_id, source_lengths, target_lengths, logit_scale
     )
