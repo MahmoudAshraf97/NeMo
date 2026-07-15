@@ -116,8 +116,8 @@ def _rnnt_loss_torch(
     return loss
 
 
-def _make_joint(vocab_size=9, dropout=0.0, fused_batch_size=2):
-    return RNNTJoint(
+def _make_joint(vocab_size=9, dropout=0.0, fused_batch_size=2, joint_type=RNNTJoint):
+    return joint_type(
         jointnet={
             "encoder_hidden": 6,
             "pred_hidden": 7,
@@ -259,6 +259,13 @@ def test_predictor_gather_forward_and_backward(dtype):
 
 @pytest.mark.unit
 def test_public_configuration_and_full_joint_error():
+    with pytest.raises(ValueError, match="prune_range must be at least 2"):
+        RNNTLoss(
+            num_classes=8,
+            loss_name="pruned_rnnt",
+            loss_kwargs={"prune_range": 1},
+        )
+
     loss = RNNTLoss(
         num_classes=8,
         loss_name="pruned_rnnt",
@@ -296,6 +303,18 @@ def test_schedule_and_joint_validation():
     assert loss._loss._current_scales(training=False) == (0.5, 1.0)
     assert loss._loss.simple_encoder.in_features == joint.encoder_hidden
     assert loss._loss.simple_predictor.in_features == joint.pred_hidden
+
+    class RNNTJointSubclass(RNNTJoint):
+        pass
+
+    subclass_loss = RNNTLoss(num_classes=8, loss_name="pruned_rnnt")
+    subclass_loss.bind_joint(_make_joint(joint_type=RNNTJointSubclass))
+
+    UnrelatedRNNTJoint = type("RNNTJoint", (torch.nn.Module,), {})
+    with pytest.raises(ValueError, match="standard RNNTJoint only"):
+        RNNTLoss(num_classes=8, loss_name="pruned_rnnt").bind_joint(
+            UnrelatedRNNTJoint()
+        )
 
     default_loss = RNNTLoss(
         num_classes=8, loss_name="pruned_rnnt", loss_kwargs={"warmup_steps": 100}

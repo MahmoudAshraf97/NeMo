@@ -56,8 +56,8 @@ class PrunedRNNTLoss(torch.nn.Module):
         initial_pruned_loss_scale: float = 0.1,
     ):
         super().__init__()
-        if prune_range < 1:
-            raise ValueError(f"prune_range must be positive, got {prune_range}")
+        if prune_range < 2:
+            raise ValueError(f"prune_range must be at least 2, got {prune_range}")
         scales = {
             "simple_loss_scale": simple_loss_scale,
             "lm_only_scale": lm_only_scale,
@@ -89,7 +89,9 @@ class PrunedRNNTLoss(torch.nn.Module):
 
     def bind_joint(self, joint: torch.nn.Module) -> None:
         """Validate and bind the compatible joint dimensions once."""
-        if joint.__class__.__name__ != "RNNTJoint":
+        from nemo.collections.asr.modules.rnnt import RNNTJoint
+
+        if not isinstance(joint, RNNTJoint):
             raise ValueError(
                 "pruned_rnnt supports the standard RNNTJoint only; sampled, HAT, TDT, multi-blank, and "
                 "multi-output joints are not supported"

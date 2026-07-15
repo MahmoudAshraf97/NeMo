@@ -52,7 +52,7 @@ def _validate_transition_inputs(
         raise ValueError(
             f"Incompatible target/blank score shapes: {tuple(target_scores.shape)} and {tuple(blank_scores.shape)}"
         )
-    batch, max_source, max_target = target_scores.shape
+    batch = target_scores.shape[0]
     if source_lengths.shape != (batch,) or target_lengths.shape != (batch,):
         raise ValueError("source_lengths and target_lengths must have shape [B]")
     if any(
@@ -62,18 +62,6 @@ def _validate_transition_inputs(
         raise ValueError(
             "Transition scores and length tensors must be on the same device"
         )
-    # Value checks are intentionally kept on the CPU oracle path.  CUDA callers
-    # are fed by NeMo's validated batch lengths and must not synchronize the host
-    # in the timed training path.
-    if not source_lengths.is_cuda:
-        if bool(torch.any(source_lengths < 1)) or bool(
-            torch.any(source_lengths > max_source)
-        ):
-            raise ValueError("Every source length must be in [1, T]")
-        if bool(torch.any(target_lengths < 0)) or bool(
-            torch.any(target_lengths > max_target)
-        ):
-            raise ValueError("Every target length must be in [0, U]")
 
 
 if TRITON_AVAILABLE:
@@ -334,8 +322,8 @@ class _RNNTLossTriton(torch.autograd.Function):
     def backward(ctx, grad_losses, _grad_target_occupation, _grad_blank_occupation):
         target_occupation, blank_occupation = ctx.saved_tensors
         scale = grad_losses.float().reshape(-1, 1, 1)
-        target_grad = (-target_occupation * scale).to(target_occupation.dtype)
-        blank_grad = (-blank_occupation * scale).to(blank_occupation.dtype)
+        target_grad = -target_occupation * scale
+        blank_grad = -blank_occupation * scale
         return target_grad, blank_grad, None, None
 
 

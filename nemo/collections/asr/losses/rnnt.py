@@ -481,7 +481,11 @@ class RNNTLoss(Loss):
     @typecheck()
     def forward(self, log_probs, targets, input_lengths, target_lengths):
         if self.requires_joint_inputs:
-            return self._loss()
+            raise RuntimeError(
+                "RNNTLoss.forward(log_probs, ...) cannot be used with a loss requiring pre-joint inputs: a full "
+                "joint tensor is already too late. Set joint.fuse_loss_wer=true and call the model's fused "
+                "RNNTJoint path."
+            )
         # Cast to int 64
         targets = targets.long()
         input_lengths = input_lengths.long()
