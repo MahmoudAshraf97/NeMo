@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from nemo.collections.asr.losses.native_rnnt import NativeRNNTLoss
 from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
@@ -137,6 +138,12 @@ RNNT_LOSS_RESOLVER = {
         lib_name="k2",
         is_available=K2_AVAILABLE,
         installation_msg=K2_INSTALLATION_MESSAGE,
+        force_float32=False,
+    ),
+    "native_rnnt": RNNTLossConfig(
+        loss_name="native_rnnt",
+        lib_name="triton",
+        is_available=True,
         force_float32=False,
     ),
     "tdt": RNNTLossConfig(
@@ -322,6 +329,9 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
     elif loss_name == "graph_w_transducer":
         loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, GraphWTransducerLoss.__init__, ignore_params={"blank"})
         loss_func = GraphWTransducerLoss(blank=blank_idx, **loss_kwargs)
+    elif loss_name == "native_rnnt":
+        loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, NativeRNNTLoss.__init__, ignore_params={"blank"})
+        loss_func = NativeRNNTLoss(blank=blank_idx, **loss_kwargs)
     else:
         raise ValueError(
             f"Invalid value of `loss_name`: {loss_name}. Allowed loss names are :" f"{loss_function_names}"
@@ -417,6 +427,16 @@ class RNNTLoss(Loss):
         self._loss = resolve_rnnt_loss(loss_name, blank_idx=self._blank, loss_kwargs=loss_kwargs)
         self._force_float32 = RNNT_LOSS_RESOLVER[loss_name].force_float32
         self._fp16_compat_checked = False
+        self._reuse_logits_for_grad = False
+
+    def _forward_fused(self, **kwargs):
+        """Run the loss with permission to reuse private fused-joint logits."""
+        previous = self._reuse_logits_for_grad
+        self._reuse_logits_for_grad = True
+        try:
+            return self(**kwargs)
+        finally:
+            self._reuse_logits_for_grad = previous
 
     def reduce(self, losses, target_lengths):
 
@@ -485,7 +505,12 @@ class RNNTLoss(Loss):
         self._loss.reduction = None
 
         # Compute RNNT loss
-        loss = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
+        loss_kwargs = {"reuse_logits_for_grad": self._reuse_logits_for_grad} if isinstance(
+            self._loss, NativeRNNTLoss
+        ) else {}
+        loss = self._loss(
+            acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths, **loss_kwargs
+        )
 
         # Loss reduction can be dynamic, so reset it after call
         self._loss.reduction = loss_reduction

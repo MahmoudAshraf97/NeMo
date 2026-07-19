@@ -29,6 +29,7 @@ def _rnnt_logprobs_fwd_kernel(
     blank_id: int,
     target_scores_ptr,
     blank_scores_ptr,
+    HAS_SINGLE_TAIL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -55,8 +56,14 @@ def _rnnt_logprobs_fwd_kernel(
     logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
     # stable log softmax calculation
     logits_max = tl.max(logits, axis=0)
+    if HAS_SINGLE_TAIL:
+        tail_logit = tl.load(logits_ptr + BLOCK_SIZE).to(tl.float32)
+        logits_max = tl.maximum(logits_max, tail_logit)
     logits_minus_max = logits - logits_max
-    denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
+    denominator_sum = tl.sum(tl.exp(logits_minus_max), axis=0)
+    if HAS_SINGLE_TAIL:
+        denominator_sum += tl.exp(tail_logit - logits_max)
+    denominator = tl.log(denominator_sum)
     blank_logit = tl.load(logits_ptr + blank_id).to(tl.float32)
     flat_index_output = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
     tl.store(blank_scores_ptr + flat_index_output, blank_logit - logits_max - denominator)
@@ -81,6 +88,9 @@ def _rnnt_logprobs_bwd_kernel(
     blank_id: int,
     grad_target_scores_ptr,
     grad_blank_scores_ptr,
+    clamp: float,
+    CLAMP_GRAD: tl.constexpr,
+    HAS_SINGLE_TAIL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -95,9 +105,7 @@ def _rnnt_logprobs_bwd_kernel(
     # load lengths for source/target
     source_len = tl.load(source_lengths_ptr + batch_i)
     target_len = tl.load(target_lengths_ptr + batch_i)
-    if source_i >= source_len or target_i > target_len:
-        # no calculations required
-        return
+    valid_state = (source_i < source_len) & (target_i <= target_len)
 
     # calculate offset in [B, T, U+1, V] tensor for the current vector with target logits/grad_logits
     flat_index = ((batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i) * num_labels
@@ -106,25 +114,43 @@ def _rnnt_logprobs_bwd_kernel(
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < num_labels
-    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(logits_ptr + col_offsets, mask=mask & valid_state, other=-float("inf")).to(tl.float32)
     # stable log softmax calculation
     logits_max = tl.max(logits, axis=0)
+    if HAS_SINGLE_TAIL:
+        tail_logit = tl.load(
+            logits_ptr + BLOCK_SIZE, mask=valid_state, other=-float("inf")
+        ).to(tl.float32)
+        logits_max = tl.maximum(logits_max, tail_logit)
     logits_minus_max = logits - logits_max
-    denominator = tl.log(tl.sum(tl.exp(logits_minus_max), axis=0))
-    log_softmax = logits_minus_max - denominator
+    unnormalized = tl.exp(logits_minus_max)
+    denominator_sum = tl.sum(unnormalized, axis=0)
+    if HAS_SINGLE_TAIL:
+        tail_unnormalized = tl.exp(tail_logit - logits_max)
+        denominator_sum += tail_unnormalized
     # softmax for gradient
-    softmax = tl.exp(log_softmax)
+    softmax = unnormalized / denominator_sum
 
     flat_index_grad = (batch_i * max_source_len + source_i) * max_target_len_plus_1 + target_i
-    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grad).to(tl.float32)
-    target_i_valid = target_i < target_len
+    blank_grad = tl.load(grad_blank_scores_ptr + flat_index_grad, mask=valid_state, other=0.0).to(tl.float32)
+    target_i_valid = valid_state & (target_i < target_len)
     target_grad = tl.load(grad_target_scores_ptr + flat_index_grad, mask=target_i_valid, other=0.0).to(tl.float32)
     target_id = tl.load(targets_ptr + batch_i * (max_target_len_plus_1 - 1) + target_i, mask=target_i_valid, other=-1)
 
     grad_not_in_targets = (-softmax) * (blank_grad + target_grad)
     grad = tl.where(col_offsets == blank_id, blank_grad + grad_not_in_targets, grad_not_in_targets)
     grad = tl.where(col_offsets == target_id, target_grad + grad_not_in_targets, grad)
+    if CLAMP_GRAD:
+        grad = tl.maximum(tl.minimum(grad, clamp), -clamp)
+    grad = tl.where(valid_state, grad, 0.0)
     tl.store(grad_logits_ptr + col_offsets, grad, mask=mask)
+    if HAS_SINGLE_TAIL:
+        tail_grad = -tail_unnormalized / denominator_sum * (blank_grad + target_grad)
+        tail_grad += tl.where(BLOCK_SIZE == blank_id, blank_grad, 0.0)
+        tail_grad += tl.where(BLOCK_SIZE == target_id, target_grad, 0.0)
+        if CLAMP_GRAD:
+            tail_grad = tl.maximum(tl.minimum(tail_grad, clamp), -clamp)
+        tl.store(grad_logits_ptr + BLOCK_SIZE, tl.where(valid_state, tail_grad, 0.0))
 
 
 class RnntLogProbs(torch.autograd.Function):
@@ -140,6 +166,8 @@ class RnntLogProbs(torch.autograd.Function):
         blank_id: int,
         source_lengths: torch.Tensor | None,
         target_lengths: torch.Tensor | None,
+        clamp: float,
+        reuse_logits_for_grad: bool,
     ):
         """
 
@@ -173,6 +201,7 @@ class RnntLogProbs(torch.autograd.Function):
             target_lengths = target_lengths.contiguous()
 
         # run Triton kernel
+        block_size = triton.next_power_of_2(max(1, logits.shape[-1] - 1))
         _rnnt_logprobs_fwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
             targets_ptr=targets,
@@ -184,12 +213,15 @@ class RnntLogProbs(torch.autograd.Function):
             blank_id=blank_id,
             target_scores_ptr=target_scores,
             blank_scores_ptr=blank_scores,
-            BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
+            HAS_SINGLE_TAIL=block_size < logits.shape[-1],
+            BLOCK_SIZE=block_size,
         )
 
         # saving for backward
         ctx.save_for_backward(logits, targets, source_lengths, target_lengths)
         ctx.blank_id = blank_id
+        ctx.clamp = float(clamp) if clamp > 0.0 else 0.0
+        ctx.reuse_logits_for_grad = reuse_logits_for_grad
         return target_scores, blank_scores
 
     @staticmethod
@@ -207,7 +239,9 @@ class RnntLogProbs(torch.autograd.Function):
         """
         (logits, targets, source_lengths, target_lengths) = ctx.saved_tensors
         blank_id = ctx.blank_id
-        grad_logits = torch.zeros_like(logits)
+        clamp = ctx.clamp
+        grad_logits = logits if ctx.reuse_logits_for_grad else torch.zeros_like(logits)
+        block_size = triton.next_power_of_2(max(1, logits.shape[-1] - 1))
         _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
             logits_ptr=logits,
             grad_logits_ptr=grad_logits,
@@ -220,9 +254,12 @@ class RnntLogProbs(torch.autograd.Function):
             blank_id=blank_id,
             grad_target_scores_ptr=grad_target_scores,
             grad_blank_scores_ptr=grad_blank_scores,
-            BLOCK_SIZE=triton.next_power_of_2(logits.shape[-1]),
+            clamp=clamp,
+            CLAMP_GRAD=clamp > 0.0,
+            HAS_SINGLE_TAIL=block_size < logits.shape[-1],
+            BLOCK_SIZE=block_size,
         )
-        return grad_logits, None, None, None, None
+        return grad_logits, None, None, None, None, None, None
 
 
 def rnnt_logprobs_triton(
@@ -231,6 +268,8 @@ def rnnt_logprobs_triton(
     blank_id: int,
     source_lengths: torch.Tensor | None = None,
     target_lengths: torch.Tensor | None = None,
+    clamp: float = -1.0,
+    reuse_logits_for_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Given logits, calculate log probabilities for blank and target labels needed for transducer loss calculation.
@@ -242,9 +281,50 @@ def rnnt_logprobs_triton(
         blank_id: id of the blank output
         source_lengths: optional tensor with lengths for source utterances
         target_lengths: optional tensor with lengths for targets
+        reuse_logits_for_grad: overwrite logits with their gradient during backward; only safe for private,
+            disposable logits
 
     Returns:
         Tuple of tensors with log probabilities for targets and blank labels, both of size [B, T, U+1].
         For the non-existent targets (U+1 or beyond target_lengths) output is zero.
     """
-    return RnntLogProbs.apply(logits, targets, blank_id, source_lengths, target_lengths)
+    return RnntLogProbs.apply(
+        logits, targets, blank_id, source_lengths, target_lengths, clamp, reuse_logits_for_grad
+    )
+
+
+def rnnt_logprobs_grad_triton(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    blank_id: int,
+    grad_target_scores: torch.Tensor,
+    grad_blank_scores: torch.Tensor,
+    source_lengths: torch.Tensor,
+    target_lengths: torch.Tensor,
+    clamp: float = -1.0,
+    *,
+    reuse_logits: bool = False,
+) -> torch.Tensor:
+    """Compute dense logit gradients directly from transition-score gradients."""
+    targets = targets.contiguous()
+    grad_logits = logits.detach() if reuse_logits else torch.empty_like(logits)
+    clamp = float(clamp) if clamp > 0.0 else 0.0
+    block_size = triton.next_power_of_2(max(1, logits.shape[-1] - 1))
+    _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](
+        logits_ptr=logits,
+        grad_logits_ptr=grad_logits,
+        source_lengths_ptr=source_lengths,
+        target_lengths_ptr=target_lengths,
+        targets_ptr=targets,
+        max_source_len=logits.shape[1],
+        max_target_len_plus_1=logits.shape[2],
+        num_labels=logits.shape[3],
+        blank_id=blank_id,
+        grad_target_scores_ptr=grad_target_scores,
+        grad_blank_scores_ptr=grad_blank_scores,
+        clamp=clamp,
+        CLAMP_GRAD=clamp > 0.0,
+        HAS_SINGLE_TAIL=block_size < logits.shape[-1],
+        BLOCK_SIZE=block_size,
+    )
+    return grad_logits

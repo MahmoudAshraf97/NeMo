@@ -1574,7 +1574,10 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     self.loss.reduction = None
 
                     # compute and preserve loss
-                    loss_batch = self.loss(
+                    loss_fn = self.loss
+                    if self.log_softmax is not True:
+                        loss_fn = getattr(self.loss, "_forward_fused", loss_fn)
+                    loss_batch = loss_fn(
                         log_probs=sub_joint,
                         targets=sub_transcripts,
                         input_lengths=sub_enc_lens,
