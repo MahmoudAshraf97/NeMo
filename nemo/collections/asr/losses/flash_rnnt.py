@@ -16,6 +16,7 @@
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nemo.collections.asr.losses.native_rnnt import NativeRNNTLoss
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
@@ -25,18 +26,8 @@ def _relu_join_impl(encoder: torch.Tensor, predictor: torch.Tensor) -> torch.Ten
     return F.relu(encoder.unsqueeze(2) + predictor.unsqueeze(1))
 
 
-def _relu_join_backward_impl(
-    grad_hidden: torch.Tensor, hidden: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    grad_preactivation = grad_hidden * (hidden > 0)
-    return grad_preactivation.sum(2), grad_preactivation.sum(1)
-
-
 _relu_join = torch.compile(
     _relu_join_impl, fullgraph=True, options={"triton.cudagraphs": False}
-)
-_relu_join_backward = torch.compile(
-    _relu_join_backward_impl, fullgraph=True, options={"triton.cudagraphs": False}
 )
 
 
@@ -58,198 +49,34 @@ def _join_hidden(
     return _activate(encoder.unsqueeze(2) + predictor.unsqueeze(1), activation)
 
 
-class _FlashRNNT(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        encoder,
-        predictor,
+def _chunk_scores(
+    projected_encoder: torch.Tensor,
+    projected_predictor: torch.Tensor,
+    targets: torch.Tensor,
+    source_lengths: torch.Tensor,
+    target_lengths: torch.Tensor,
+    output_weight: torch.Tensor,
+    output_bias: torch.Tensor,
+    activation: str,
+    blank: int,
+    clamp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Calculate transition scores for one disposable joint chunk."""
+    from nemo.collections.asr.parts.k2.rnnt_logprobs_triton import (
+        rnnt_logprobs_triton,
+    )
+
+    hidden = _join_hidden(projected_encoder, projected_predictor, activation)
+    logits = F.linear(hidden, output_weight, output_bias)
+    return rnnt_logprobs_triton(
+        logits,
         targets,
-        source_lengths,
-        target_lengths,
-        encoder_weight,
-        encoder_bias,
-        predictor_weight,
-        predictor_bias,
-        output_weight,
-        output_bias,
-        activation,
         blank,
-        fastemit_lambda,
-        clamp,
-        chunk_bounds,
-    ):
-        from nemo.collections.asr.parts.k2.rnnt_logprobs_triton import (
-            rnnt_logprobs_triton,
-        )
-        from nemo.collections.asr.parts.native_rnnt import (
-            rnnt_loss_triton_with_occupations,
-        )
-
-        projected_encoder = F.linear(encoder, encoder_weight, encoder_bias)
-        projected_predictor = F.linear(predictor, predictor_weight, predictor_bias)
-        target_scores = torch.zeros(
-            (encoder.shape[0], encoder.shape[1], predictor.shape[1]),
-            device=encoder.device,
-            dtype=torch.float32,
-        )
-        blank_scores = torch.zeros_like(target_scores)
-        for begin, end, max_source, max_target in chunk_bounds:
-            hidden = _join_hidden(
-                projected_encoder[begin:end, :max_source],
-                projected_predictor[begin:end, : max_target + 1],
-                activation,
-            )
-            logits = F.linear(hidden, output_weight, output_bias)
-            chunk_target_scores, chunk_blank_scores = rnnt_logprobs_triton(
-                logits,
-                targets[begin:end, :max_target],
-                blank,
-                source_lengths=source_lengths[begin:end],
-                target_lengths=target_lengths[begin:end],
-            )
-            target_scores[begin:end, :max_source, : max_target + 1] = (
-                chunk_target_scores
-            )
-            blank_scores[begin:end, :max_source, : max_target + 1] = chunk_blank_scores
-        losses, target_occupation, blank_occupation = rnnt_loss_triton_with_occupations(
-            target_scores[..., :-1],
-            blank_scores,
-            source_lengths,
-            target_lengths,
-            fastemit_lambda,
-        )
-
-        ctx.save_for_backward(
-            encoder,
-            predictor,
-            targets,
-            source_lengths,
-            target_lengths,
-            projected_encoder,
-            projected_predictor,
-            encoder_weight,
-            predictor_weight,
-            output_weight,
-            output_bias,
-            target_occupation,
-            blank_occupation,
-        )
-        ctx.activation = activation
-        ctx.blank = blank
-        ctx.fastemit_scale = 1.0 + fastemit_lambda
-        ctx.clamp = clamp
-        ctx.chunk_bounds = chunk_bounds
-        return losses
-
-    @staticmethod
-    def backward(ctx, grad_losses):
-        from nemo.collections.asr.parts.k2.rnnt_logprobs_triton import (
-            rnnt_logprobs_grad_triton,
-        )
-
-        (
-            encoder,
-            predictor,
-            targets,
-            source_lengths,
-            target_lengths,
-            projected_encoder,
-            projected_predictor,
-            encoder_weight,
-            predictor_weight,
-            output_weight,
-            output_bias,
-            target_occupation,
-            blank_occupation,
-        ) = ctx.saved_tensors
-
-        grad_projected_encoder = torch.zeros_like(projected_encoder)
-        grad_projected_predictor = torch.zeros_like(projected_predictor)
-        grad_output_weight = torch.zeros_like(output_weight)
-        grad_output_bias = torch.zeros_like(output_bias)
-        for begin, end, max_source, max_target in ctx.chunk_bounds:
-            hidden = _join_hidden(
-                projected_encoder[begin:end, :max_source],
-                projected_predictor[begin:end, : max_target + 1],
-                ctx.activation,
-            )
-            logits = F.linear(hidden, output_weight, output_bias)
-            scale = grad_losses[begin:end].float().reshape(-1, 1, 1)
-            chunk_blank_occupation = blank_occupation[
-                begin:end, :max_source, : max_target + 1
-            ]
-            grad_target_scores = torch.zeros_like(chunk_blank_occupation)
-            grad_target_scores[..., :-1] = -target_occupation[
-                begin:end, :max_source, :max_target
-            ] * (scale * ctx.fastemit_scale)
-            grad_blank_scores = -chunk_blank_occupation * scale
-            grad_logits = rnnt_logprobs_grad_triton(
-                logits,
-                targets[begin:end, :max_target],
-                ctx.blank,
-                grad_target_scores,
-                grad_blank_scores,
-                source_lengths[begin:end],
-                target_lengths[begin:end],
-                clamp=ctx.clamp,
-                reuse_logits=True,
-            )
-            grad_logits_2d = grad_logits.flatten(0, 2)
-            hidden_2d = hidden.flatten(0, 2)
-            grad_hidden = torch.matmul(grad_logits, output_weight)
-            grad_output_weight.add_(
-                torch.matmul(grad_logits_2d.transpose(0, 1), hidden_2d)
-            )
-            grad_output_bias.add_(grad_logits_2d.sum(0))
-            if ctx.activation == "relu":
-                grad_encoder_chunk, grad_predictor_chunk = _relu_join_backward(
-                    grad_hidden, hidden
-                )
-                grad_projected_encoder[begin:end, :max_source] = grad_encoder_chunk
-                grad_projected_predictor[begin:end, : max_target + 1] = (
-                    grad_predictor_chunk
-                )
-                continue
-            if ctx.activation == "sigmoid":
-                grad_preactivation = grad_hidden * hidden * (1 - hidden)
-            else:
-                grad_preactivation = grad_hidden * (1 - hidden * hidden)
-            grad_projected_encoder[begin:end, :max_source] = grad_preactivation.sum(2)
-            grad_projected_predictor[begin:end, : max_target + 1] = (
-                grad_preactivation.sum(1)
-            )
-
-        encoder_2d = encoder.flatten(0, 1)
-        predictor_2d = predictor.flatten(0, 1)
-        grad_encoder_2d = grad_projected_encoder.flatten(0, 1)
-        grad_predictor_2d = grad_projected_predictor.flatten(0, 1)
-        grad_encoder = torch.matmul(grad_projected_encoder, encoder_weight)
-        grad_predictor = torch.matmul(grad_projected_predictor, predictor_weight)
-        grad_encoder_weight = torch.matmul(grad_encoder_2d.transpose(0, 1), encoder_2d)
-        grad_predictor_weight = torch.matmul(
-            grad_predictor_2d.transpose(0, 1), predictor_2d
-        )
-        grad_encoder_bias = grad_encoder_2d.sum(0)
-        grad_predictor_bias = grad_predictor_2d.sum(0)
-        return (
-            grad_encoder,
-            grad_predictor,
-            None,
-            None,
-            None,
-            grad_encoder_weight,
-            grad_encoder_bias,
-            grad_predictor_weight,
-            grad_predictor_bias,
-            grad_output_weight,
-            grad_output_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        source_lengths=source_lengths,
+        target_lengths=target_lengths,
+        clamp=clamp,
+        reuse_logits_for_grad=True,
+    )
 
 
 def flash_rnnt_loss_from_joint(
@@ -329,23 +156,51 @@ def flash_rnnt_loss_from_joint(
         )
         begin = end
 
+    from nemo.collections.asr.parts.native_rnnt import rnnt_loss_triton
+
+    encoder = encoder.transpose(1, 2)
+    predictor = predictor.transpose(1, 2)
+    projected_encoder = F.linear(encoder, joint.enc.weight, joint.enc.bias)
+    projected_predictor = F.linear(predictor, joint.pred.weight, joint.pred.bias)
+    target_score_chunks = []
+    blank_score_chunks = []
     output = joint.joint_net[-1]
-    losses = _FlashRNNT.apply(
-        encoder.transpose(1, 2),
-        predictor.transpose(1, 2),
-        targets,
+    for begin, end, max_source, max_target in chunk_bounds:
+        chunk_target_scores, chunk_blank_scores = checkpoint(
+            _chunk_scores,
+            projected_encoder[begin:end, :max_source],
+            projected_predictor[begin:end, : max_target + 1],
+            targets[begin:end, :max_target],
+            source_lengths[begin:end],
+            target_lengths[begin:end],
+            output.weight,
+            output.bias,
+            joint.activation,
+            loss.blank,
+            loss.clamp,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+        padding = (
+            0,
+            predictor.shape[1] - max_target - 1,
+            0,
+            encoder.shape[1] - max_source,
+        )
+        if any(padding):
+            chunk_target_scores = F.pad(chunk_target_scores, padding)
+            chunk_blank_scores = F.pad(chunk_blank_scores, padding)
+        target_score_chunks.append(chunk_target_scores)
+        blank_score_chunks.append(chunk_blank_scores)
+
+    target_scores = torch.cat(target_score_chunks)
+    blank_scores = torch.cat(blank_score_chunks)
+
+    losses = rnnt_loss_triton(
+        target_scores[..., :-1],
+        blank_scores,
         source_lengths,
         target_lengths,
-        joint.enc.weight,
-        joint.enc.bias,
-        joint.pred.weight,
-        joint.pred.bias,
-        output.weight,
-        output.bias,
-        joint.activation,
-        loss.blank,
         loss.fastemit_lambda,
-        loss.clamp,
-        tuple(chunk_bounds),
     )
     return losses.index_select(0, inverse_order) if sort_by_target else losses

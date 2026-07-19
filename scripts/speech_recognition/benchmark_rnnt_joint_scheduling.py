@@ -130,7 +130,7 @@ def _build_loss(method, blank):
 
     kwargs = None
     if method == "warprnnt_numba":
-        kwargs = {"fastemit_lambda": 0.01, "clamp": -1.0}
+        kwargs = {"fastemit_lambda": 0.0, "clamp": -1.0}
     elif method == "graph_rnnt":
         kwargs = {
             "use_grid_implementation": True,
@@ -138,7 +138,7 @@ def _build_loss(method, blank):
             "cast_to_float32": False,
         }
     elif method in {"native_rnnt", "flash_rnnt"}:
-        kwargs = {"fastemit_lambda": 0.01, "clamp": -1.0}
+        kwargs = {"fastemit_lambda": 0.0, "clamp": -1.0}
     loss_name = "native_rnnt" if method == "flash_rnnt" else method
     loss = RNNTLoss(
         num_classes=blank, reduction=None, loss_name=loss_name, loss_kwargs=kwargs
@@ -160,7 +160,7 @@ def _run_job(args) -> dict:
     torch.cuda.manual_seed_all(12345)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    vocab = 1025
+    vocab = 1024
     length_batches = _profile_length_batches(args)
     batch = len(length_batches[0][0])
     if any(len(source) != batch for source, _ in length_batches):

@@ -294,11 +294,12 @@ def test_native_rnnt_fused_batch_equivalence(fused_batch_size):
 
 @pytest.mark.unit
 @pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
+@pytest.mark.parametrize("activation", ["relu", "sigmoid", "tanh"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_flash_rnnt_matches_dense_native_loss_and_gradients(dtype):
+def test_flash_rnnt_matches_dense_native_loss_and_gradients(dtype, activation):
     torch.manual_seed(19)
-    dense_joint = _make_joint(4).to(dtype)
-    flash_joint = _make_joint(4).to(dtype)
+    dense_joint = _make_joint(4, activation=activation).to(dtype)
+    flash_joint = _make_joint(4, activation=activation).to(dtype)
     flash_joint.load_state_dict(dense_joint.state_dict())
     dense_loss = NativeRNNTLoss(blank=7, fastemit_lambda=0.01)
     flash_loss = NativeRNNTLoss(blank=7, fastemit_lambda=0.01)
