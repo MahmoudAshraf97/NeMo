@@ -1342,7 +1342,11 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     and compute_wer is set.
 
         fused_batch_size: Optional int, required if `fuse_loss_wer` flag is set. Determines the size of the
-            sub-batches. Should be any value below the actual batch size per GPU.
+            sub-batches. Should be any value below the actual batch size per GPU. With `flash_rnnt`, this is
+            the maximum number of samples in each Flash workspace chunk, not the maximum number of chunks.
+            Increase it to reduce chunk launch/recomputation overhead; decrease it when the disposable joint
+            workspace is too large. Benchmark representative lengths because throughput usually plateaus before
+            the largest possible value.
         masking_prob: Optional float, indicating the probability of masking out decoder output in HAINAN
             (Hybrid Autoregressive Inference Transducer) model, described in https://arxiv.org/pdf/2410.02597
             Default to -1.0, which runs standard Joint network computation; if > 0, then masking out decoder output
@@ -1435,6 +1439,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             raise ValueError("If `fuse_loss_wer` is set, then `fused_batch_size` cannot be None!")
 
         self._loss = None
+        self._loss_uses_factorized_joint = False
         self._wer = None
 
         # Log softmax should be applied explicitly only for CPU
@@ -1517,9 +1522,27 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     "`fuse_loss_wer` is set, therefore encoder and target lengths " "must be provided as well!"
                 )
 
-            losses = []
+            uses_factorized_joint_loss = self._loss_uses_factorized_joint
+            if decoder_outputs is None:
+                losses = None
+            elif uses_factorized_joint_loss:
+                losses = self.loss.forward_from_joint(
+                    joint=self,
+                    encoder=encoder_outputs.transpose(1, 2),
+                    predictor=decoder_outputs.transpose(1, 2),
+                    targets=transcripts,
+                    input_lengths=encoder_lengths,
+                    target_lengths=transcript_lengths,
+                    max_samples_per_chunk=self._fused_batch_size,
+                )
+            else:
+                losses = []
+            if uses_factorized_joint_loss and not compute_wer:
+                self.hypotheses = [] if keep_hypotheses else None
+                return losses, None, None, None
+
             wers, wer_nums, wer_denoms = [], [], []
-            target_lengths = []
+            loss_target_lengths = []
             batch_size = int(encoder_outputs.size(0))  # actual batch size
             hypotheses = []
 
@@ -1537,12 +1560,11 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 sub_enc_lens = encoder_lengths[begin:end]
                 sub_transcript_lens = transcript_lengths[begin:end]
 
-                # Sub transcripts does not need the full padding of the entire batch
-                # Therefore reduce the decoder time steps to match
-                max_sub_enc_length = sub_enc_lens.max()
-                max_sub_transcript_length = sub_transcript_lens.max()
+                if decoder_outputs is not None and not uses_factorized_joint_loss:
+                    # Sub transcripts does not need the full padding of the entire batch.
+                    max_sub_enc_length = sub_enc_lens.max()
+                    max_sub_transcript_length = sub_transcript_lens.max()
 
-                if decoder_outputs is not None:
                     # Reduce encoder length to preserve computation
                     # Encoder: [sub-batch, T, D] -> [sub-batch, T', D]; T' < T
                     if sub_enc.shape[1] != max_sub_enc_length:
@@ -1574,22 +1596,19 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     self.loss.reduction = None
 
                     # compute and preserve loss
-                    loss_fn = self.loss
-                    if self.log_softmax is not True:
-                        loss_fn = getattr(self.loss, "_forward_fused", loss_fn)
-                    loss_batch = loss_fn(
+                    loss_batch = self.loss(
                         log_probs=sub_joint,
                         targets=sub_transcripts,
                         input_lengths=sub_enc_lens,
                         target_lengths=sub_transcript_lens,
                     )
                     losses.append(loss_batch)
-                    target_lengths.append(sub_transcript_lens)
+                    loss_target_lengths.append(sub_transcript_lens)
 
                     # reset loss reduction type
                     self.loss.reduction = loss_reduction
 
-                else:
+                elif decoder_outputs is None:
                     losses = None
 
                 # Update WER for sub batch
@@ -1627,8 +1646,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 del sub_enc, sub_transcripts, sub_enc_lens, sub_transcript_lens
 
             # Reduce over sub batches
-            if losses is not None:
-                losses = self.loss.reduce(losses, target_lengths)
+            if losses is not None and not uses_factorized_joint_loss:
+                losses = self.loss.reduce(losses, loss_target_lengths)
 
             # Collect sub batch wer results
             if compute_wer:
@@ -1809,6 +1828,11 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             raise ValueError("Attempting to set loss module even though `fuse_loss_wer` is not set!")
 
         self._loss = loss
+        self._loss_uses_factorized_joint = bool(getattr(loss, "requires_factorized_joint", False))
+
+    @property
+    def loss_uses_factorized_joint(self):
+        return self._loss_uses_factorized_joint
 
     @property
     def wer(self):
@@ -1828,6 +1852,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self._fuse_loss_wer = fuse_loss_wer
 
         self._loss = loss
+        self._loss_uses_factorized_joint = bool(getattr(loss, "requires_factorized_joint", False))
         self._wer = metric
 
     @property
@@ -2031,6 +2056,9 @@ class SampledRNNTJoint(RNNTJoint):
                 transcript_lengths=transcript_lengths,
                 compute_wer=compute_wer,
             )
+
+        if self.loss_uses_factorized_joint:
+            raise ValueError("Flash RNN-T is incompatible with SampledRNNTJoint training")
 
         if transcripts is None or transcript_lengths is None:
             logging.warning(

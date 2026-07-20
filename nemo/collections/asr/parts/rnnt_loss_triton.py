@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native CUDA dynamic programming for the standard RNN-T loss."""
+"""Shared Triton dynamic programming for exact standard RNN-T losses."""
 
 from __future__ import annotations
 
@@ -25,8 +25,9 @@ if TRITON_AVAILABLE:
     import triton.language as tl
 
 
-# One Triton block scans U + 1 alignment states, with at most 1024 lanes.
-MAX_TARGET_TOKENS = 1023
+# One program scans U + 1 states in one power-of-two block. This is a hard
+# implementation bound, not a numerical-accuracy guarantee or a reserved size.
+MAX_TARGET_TOKENS = 16_383
 
 
 def _validate_transition_inputs(
@@ -36,26 +37,16 @@ def _validate_transition_inputs(
     target_lengths: torch.Tensor,
 ) -> None:
     if target_scores.ndim != 3 or blank_scores.ndim != 3:
-        raise ValueError(
-            "RNN-T transition scores must have shape [B, T, U] and [B, T, U + 1]"
-        )
-    if (
-        blank_scores.shape[:2] != target_scores.shape[:2]
-        or blank_scores.shape[2] != target_scores.shape[2] + 1
-    ):
+        raise ValueError("RNN-T transition scores must have shape [B, T, U] and [B, T, U + 1]")
+    if blank_scores.shape[:2] != target_scores.shape[:2] or blank_scores.shape[2] != target_scores.shape[2] + 1:
         raise ValueError(
             f"Incompatible target/blank score shapes: {tuple(target_scores.shape)} and {tuple(blank_scores.shape)}"
         )
     batch = target_scores.shape[0]
     if source_lengths.shape != (batch,) or target_lengths.shape != (batch,):
         raise ValueError("source_lengths and target_lengths must have shape [B]")
-    if any(
-        tensor.device != target_scores.device
-        for tensor in (blank_scores, source_lengths, target_lengths)
-    ):
-        raise ValueError(
-            "Transition scores and length tensors must be on the same device"
-        )
+    if any(tensor.device != target_scores.device for tensor in (blank_scores, source_lengths, target_lengths)):
+        raise ValueError("Transition scores and length tensors must be on the same device")
 
 
 if TRITON_AVAILABLE:
@@ -90,21 +81,14 @@ if TRITON_AVAILABLE:
         batch_idx = tl.program_id(0)
         source_len = tl.load(source_lengths_ptr + batch_idx)
         target_len = tl.load(target_lengths_ptr + batch_idx)
-        valid_lengths = (
-            (source_len >= 1)
-            & (source_len <= max_source)
-            & (target_len >= 0)
-            & (target_len <= max_target)
-        )
+        valid_lengths = (source_len >= 1) & (source_len <= max_source) & (target_len >= 0) & (target_len <= max_target)
         symbols = tl.arange(0, block_target)
         valid_symbol = valid_lengths & (symbols <= target_len)
         previous = tl.where(symbols == 0, 0.0, -float("inf"))
 
         for time_idx in tl.range(0, max_source):
             active_time = valid_lengths & (time_idx < source_len)
-            blank_offset = (batch_idx * max_source + time_idx - 1) * (
-                max_target + 1
-            ) + symbols
+            blank_offset = (batch_idx * max_source + time_idx - 1) * (max_target + 1) + symbols
             from_blank = previous + tl.load(
                 blank_scores_ptr + blank_offset,
                 mask=(time_idx > 0) & active_time & valid_symbol,
@@ -116,29 +100,21 @@ if TRITON_AVAILABLE:
                 from_blank,
             )
 
-            target_offset = (
-                (batch_idx * max_source + time_idx) * max_target + symbols - 1
-            )
+            target_offset = (batch_idx * max_source + time_idx) * max_target + symbols - 1
             step = tl.load(
                 target_scores_ptr + target_offset,
                 mask=active_time & (symbols > 0) & (symbols <= target_len),
                 other=-float("inf"),
             )
-            current, _ = tl.associative_scan(
-                (base, step), axis=0, combine_fn=_log_semiring_compose
-            )
+            current, _ = tl.associative_scan((base, step), axis=0, combine_fn=_log_semiring_compose)
             current = tl.where(valid_symbol, current, -float("inf"))
 
-            alpha_offset = (batch_idx * max_source + time_idx) * (
-                max_target + 1
-            ) + symbols
+            alpha_offset = (batch_idx * max_source + time_idx) * (max_target + 1) + symbols
             tl.store(alpha_ptr + alpha_offset, current, mask=active_time & valid_symbol)
             previous = tl.where(active_time, current, previous)
 
         final_alpha = tl.sum(tl.where(symbols == target_len, previous, 0.0), axis=0)
-        final_blank_offset = (batch_idx * max_source + source_len - 1) * (
-            max_target + 1
-        ) + target_len
+        final_blank_offset = (batch_idx * max_source + source_len - 1) * (max_target + 1) + target_len
         final_blank = tl.load(
             blank_scores_ptr + final_blank_offset,
             mask=valid_lengths,
@@ -156,9 +132,7 @@ if TRITON_AVAILABLE:
         for reverse_time in tl.range(0, max_source):
             time_idx = max_source - reverse_time - 1
             active_time = valid_lengths & (time_idx < source_len)
-            blank_offset = (batch_idx * max_source + time_idx) * (
-                max_target + 1
-            ) + symbols
+            blank_offset = (batch_idx * max_source + time_idx) * (max_target + 1) + symbols
             blank = tl.load(
                 blank_scores_ptr + blank_offset,
                 mask=active_time & valid_symbol,
@@ -181,14 +155,10 @@ if TRITON_AVAILABLE:
                 target,
                 -float("inf"),
             )
-            beta, _ = tl.associative_scan(
-                (base, step), axis=0, combine_fn=_log_semiring_compose
-            )
+            beta, _ = tl.associative_scan((base, step), axis=0, combine_fn=_log_semiring_compose)
             beta = tl.where(valid_symbol, beta, -float("inf"))
 
-            beta_offset = (batch_idx * max_source + time_idx) * (
-                max_target + 1
-            ) + symbols
+            beta_offset = (batch_idx * max_source + time_idx) * (max_target + 1) + symbols
             alpha = tl.load(
                 alpha_ptr + beta_offset,
                 mask=active_time & valid_symbol,
@@ -226,22 +196,13 @@ if TRITON_AVAILABLE:
         symbols = tl.arange(0, block_target)
         source_len = tl.load(source_lengths_ptr + batch_idx)
         target_len = tl.load(target_lengths_ptr + batch_idx)
-        valid_lengths = (
-            (source_len >= 1)
-            & (source_len <= max_source)
-            & (target_len >= 0)
-            & (target_len <= max_target)
-        )
+        valid_lengths = (source_len >= 1) & (source_len <= max_source) & (target_len >= 0) & (target_len <= max_target)
         valid = valid_lengths & (time_idx < source_len) & (symbols < target_len)
         alpha_offset = (batch_idx * max_source + time_idx) * (max_target + 1) + symbols
         target_offset = (batch_idx * max_source + time_idx) * max_target + symbols
         alpha = tl.load(alpha_ptr + alpha_offset, mask=valid, other=-float("inf"))
-        target = tl.load(
-            target_scores_ptr + target_offset, mask=valid, other=-float("inf")
-        )
-        beta_after = tl.load(
-            beta_ptr + alpha_offset + 1, mask=valid, other=-float("inf")
-        )
+        target = tl.load(target_scores_ptr + target_offset, mask=valid, other=-float("inf"))
+        beta_after = tl.load(beta_ptr + alpha_offset + 1, mask=valid, other=-float("inf"))
         log_likelihood = -tl.load(losses_ptr + batch_idx) / fastemit_scale
         occupation = tl.exp(alpha + target + beta_after - log_likelihood)
         tl.store(
@@ -262,12 +223,10 @@ class _RNNTLossTriton(torch.autograd.Function):
         fastemit_lambda,
     ):
         if not TRITON_AVAILABLE:
-            raise RuntimeError("Triton is required for native RNN-T CUDA training")
+            raise RuntimeError("Triton is required for RNN-T CUDA training")
         if not target_scores.is_cuda:
-            raise RuntimeError("Native RNN-T training requires CUDA tensors")
-        _validate_transition_inputs(
-            target_scores, blank_scores, source_lengths, target_lengths
-        )
+            raise RuntimeError("Triton RNN-T training requires CUDA tensors")
+        _validate_transition_inputs(target_scores, blank_scores, source_lengths, target_lengths)
 
         target_scores = target_scores.contiguous()
         blank_scores = blank_scores.contiguous()
@@ -278,7 +237,7 @@ class _RNNTLossTriton(torch.autograd.Function):
             raise ValueError("fastemit_lambda must be nonnegative")
         if max_target > MAX_TARGET_TOKENS:
             raise ValueError(
-                f"Native RNN-T supports at most {MAX_TARGET_TOKENS} padded target tokens with its "
+                f"Triton RNN-T supports at most {MAX_TARGET_TOKENS} padded target tokens with its "
                 f"one-block Triton recurrence, got {max_target}"
             )
         block_target = triton.next_power_of_2(max_target + 1)
@@ -340,19 +299,5 @@ def rnnt_loss_triton(
     fastemit_lambda: float = 0.0,
 ) -> torch.Tensor:
     """Return exact per-sample RNN-T losses from blank and target scores."""
-    return rnnt_loss_triton_with_occupations(
-        target_scores, blank_scores, source_lengths, target_lengths, fastemit_lambda
-    )[0]
-
-
-def rnnt_loss_triton_with_occupations(
-    target_scores: torch.Tensor,
-    blank_scores: torch.Tensor,
-    source_lengths: torch.Tensor,
-    target_lengths: torch.Tensor,
-    fastemit_lambda: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return exact per-sample losses and non-differentiable transition occupations."""
-    return _RNNTLossTriton.apply(
-        target_scores, blank_scores, source_lengths, target_lengths, fastemit_lambda
-    )
+    losses, _, _ = _RNNTLossTriton.apply(target_scores, blank_scores, source_lengths, target_lengths, fastemit_lambda)
+    return losses

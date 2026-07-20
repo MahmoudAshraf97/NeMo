@@ -367,6 +367,7 @@ def oomptimizer(
 
     trainer = pl.Trainer(barebones=True)
     trainer.log_every_n_steps = 1000000
+    trainer.limit_train_batches = 100000
     model_clones = []
     for _ in range(2 if ddp else 1):
         if pretrained_name is not None:

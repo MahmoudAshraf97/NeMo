@@ -18,7 +18,7 @@ from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 
 
 class NativeRNNTLoss(torch.nn.Module):
-    """Exact CUDA RNN-T loss using native Triton kernels."""
+    """Research/reference dense-logit RNN-T loss using Triton kernels."""
 
     def __init__(self, blank: int, fastemit_lambda: float = 0.0, clamp: float = -1.0):
         super().__init__()
@@ -27,9 +27,8 @@ class NativeRNNTLoss(torch.nn.Module):
         self.blank = blank
         self.fastemit_lambda = float(fastemit_lambda)
         self.clamp = float(clamp) if clamp > 0.0 else 0.0
-        self.reduction = None
 
-    def forward(self, acts, labels, act_lens, label_lens, reuse_logits_for_grad=False):
+    def forward(self, acts, labels, act_lens, label_lens):
         if not TRITON_AVAILABLE:
             raise RuntimeError("Triton is required for native RNN-T training")
         if not acts.is_cuda:
@@ -38,7 +37,7 @@ class NativeRNNTLoss(torch.nn.Module):
         from nemo.collections.asr.parts.k2.rnnt_logprobs_triton import (
             rnnt_logprobs_triton,
         )
-        from nemo.collections.asr.parts.native_rnnt import (
+        from nemo.collections.asr.parts.rnnt_loss_triton import (
             MAX_TARGET_TOKENS,
             rnnt_loss_triton,
         )
@@ -57,7 +56,6 @@ class NativeRNNTLoss(torch.nn.Module):
             source_lengths=act_lens,
             target_lengths=label_lens,
             clamp=self.clamp,
-            reuse_logits_for_grad=reuse_logits_for_grad,
         )
         return rnnt_loss_triton(
             target_scores[..., :-1],

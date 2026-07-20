@@ -35,13 +35,14 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.native_rnnt import NativeRNNTLoss
+from nemo.collections.asr.losses.flash_rnnt import FlashRNNTLoss
 from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils import numba_utils
 from nemo.core.utils.k2_utils import K2_INSTALLATION_MESSAGE
 from nemo.core.utils.numba_utils import NUMBA_INSTALLATION_MESSAGE
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE, TRITON_INSTALLATION_MESSAGE
 from nemo.utils import logging, logging_mode, model_utils
 
 try:
@@ -140,10 +141,11 @@ RNNT_LOSS_RESOLVER = {
         installation_msg=K2_INSTALLATION_MESSAGE,
         force_float32=False,
     ),
-    "native_rnnt": RNNTLossConfig(
-        loss_name="native_rnnt",
+    "flash_rnnt": RNNTLossConfig(
+        loss_name="flash_rnnt",
         lib_name="triton",
-        is_available=True,
+        is_available=TRITON_AVAILABLE,
+        installation_msg=TRITON_INSTALLATION_MESSAGE,
         force_float32=False,
     ),
     "tdt": RNNTLossConfig(
@@ -329,9 +331,9 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
     elif loss_name == "graph_w_transducer":
         loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, GraphWTransducerLoss.__init__, ignore_params={"blank"})
         loss_func = GraphWTransducerLoss(blank=blank_idx, **loss_kwargs)
-    elif loss_name == "native_rnnt":
-        loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, NativeRNNTLoss.__init__, ignore_params={"blank"})
-        loss_func = NativeRNNTLoss(blank=blank_idx, **loss_kwargs)
+    elif loss_name == "flash_rnnt":
+        loss_kwargs = _clean_kwargs(loss_name, loss_kwargs, FlashRNNTLoss.__init__, ignore_params={"blank"})
+        loss_func = FlashRNNTLoss(blank=blank_idx, **loss_kwargs)
     else:
         raise ValueError(
             f"Invalid value of `loss_name`: {loss_name}. Allowed loss names are :" f"{loss_function_names}"
@@ -380,6 +382,29 @@ class RNNTLoss(Loss):
                         warprnnt_numba_kwargs:
                             fastemit_lambda: 0.0
 
+            Flash RNN-T additionally requires ``joint.fuse_loss_wer=true`` and a
+            positive ``joint.fused_batch_size``:
+
+            .. code-block:: yaml
+
+                model:
+                    joint:
+                        fuse_loss_wer: true
+                        # Maximum samples per Flash chunk, not the number of chunks.
+                        fused_batch_size: 16
+                        jointnet:
+                            dropout: 0.1
+                    loss:
+                        loss_name: "flash_rnnt"
+                        flash_rnnt_kwargs:
+                            fastemit_lambda: 0.0
+                            clamp: -1.0
+                            # Safety guard only; actual padded U selects the compiled scan width.
+                            max_target_tokens: 16383
+
+            Start ``fused_batch_size`` at the local training batch size and lower it only if the
+            disposable joint workspace is too large or benchmarks show a better throughput point.
+
         Warning:
             In the case that GPU memory is exhausted in order to compute RNNTLoss, it might cause
             a core dump at the cuda level with the following error message.
@@ -427,16 +452,15 @@ class RNNTLoss(Loss):
         self._loss = resolve_rnnt_loss(loss_name, blank_idx=self._blank, loss_kwargs=loss_kwargs)
         self._force_float32 = RNNT_LOSS_RESOLVER[loss_name].force_float32
         self._fp16_compat_checked = False
-        self._reuse_logits_for_grad = False
 
-    def _forward_fused(self, **kwargs):
-        """Run the loss with permission to reuse private fused-joint logits."""
-        previous = self._reuse_logits_for_grad
-        self._reuse_logits_for_grad = True
-        try:
-            return self(**kwargs)
-        finally:
-            self._reuse_logits_for_grad = previous
+    @property
+    def is_flash_rnnt(self) -> bool:
+        return isinstance(self._loss, FlashRNNTLoss)
+
+    @property
+    def requires_factorized_joint(self) -> bool:
+        """Whether this loss consumes encoder/predictor projections before dense joint logits."""
+        return self.is_flash_rnnt
 
     def reduce(self, losses, target_lengths):
 
@@ -455,8 +479,38 @@ class RNNTLoss(Loss):
 
         return losses
 
+    def forward_from_joint(
+        self,
+        joint,
+        encoder: torch.Tensor,
+        predictor: torch.Tensor,
+        targets: torch.Tensor,
+        input_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+        max_samples_per_chunk: int,
+    ) -> torch.Tensor:
+        """Run Flash RNN-T before the joint network materializes dense logits."""
+        if not self.requires_factorized_joint:
+            raise RuntimeError("forward_from_joint is only valid for a factorized-joint loss")
+        targets = targets.long()
+        input_lengths = input_lengths.long()
+        target_lengths = target_lengths.long()
+        losses = self._loss(
+            joint=joint,
+            encoder=encoder,
+            predictor=predictor,
+            targets=targets,
+            source_lengths=input_lengths,
+            target_lengths=target_lengths,
+            max_samples_per_chunk=max_samples_per_chunk,
+        )
+        return self.reduce(losses, target_lengths) if self.reduction is not None else losses
+
     @typecheck()
     def forward(self, log_probs, targets, input_lengths, target_lengths):
+        if self.requires_factorized_joint:
+            raise RuntimeError("loss_name='flash_rnnt' requires joint.fuse_loss_wer=true")
+
         # Cast to int 64
         targets = targets.long()
         input_lengths = input_lengths.long()
@@ -505,12 +559,7 @@ class RNNTLoss(Loss):
         self._loss.reduction = None
 
         # Compute RNNT loss
-        loss_kwargs = {"reuse_logits_for_grad": self._reuse_logits_for_grad} if isinstance(
-            self._loss, NativeRNNTLoss
-        ) else {}
-        loss = self._loss(
-            acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths, **loss_kwargs
-        )
+        loss = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
 
         # Loss reduction can be dynamic, so reset it after call
         self._loss.reduction = loss_reduction

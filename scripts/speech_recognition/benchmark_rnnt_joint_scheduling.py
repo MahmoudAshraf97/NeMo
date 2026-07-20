@@ -27,8 +27,9 @@ import time
 from pathlib import Path
 
 
+# Native remains available here as a research baseline, not as a model loss option.
 METHODS = ("warprnnt_numba", "graph_rnnt", "native_rnnt", "flash_rnnt")
-MODES = ("before", "full_projection", "state_budget_only", "state_budget")
+MODES = ("before", "full_projection")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,11 +43,18 @@ def _parser() -> argparse.ArgumentParser:
         default=["target", "tawseem"],
     )
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--fused-batch-size", type=int, default=4)
-    parser.add_argument("--max-budget-batch-size", type=int, default=16)
-    parser.add_argument("--state-budget", type=int, default=210_000)
+    parser.add_argument("--source-length", type=int, default=400)
+    parser.add_argument("--target-length", type=int, default=128)
+    parser.add_argument("--min-length-fraction", type=float, default=1.0)
+    parser.add_argument(
+        "--fused-batch-size",
+        type=int,
+        default=4,
+        help="Maximum samples per joint chunk.",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--dropout", type=float, default=0.0, help="Joint dropout probability.")
     parser.add_argument("--length-profile", type=Path)
     parser.add_argument("--profile-index", type=int, default=0)
     parser.add_argument(
@@ -54,18 +62,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Prewarm and measure every stored TAWSEEM length batch once.",
     )
-    parser.add_argument(
-        "--output", type=Path, default=Path("rnnt_joint_scheduling_results.json")
-    )
+    parser.add_argument("--output", type=Path, default=Path("rnnt_joint_scheduling_results.json"))
     parser.add_argument("--job", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--no-reuse-logits", action="store_true", help=argparse.SUPPRESS
-    )
     parser.add_argument("--method", choices=METHODS, help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=MODES, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--profile", choices=("target", "tawseem"), help=argparse.SUPPRESS
-    )
+    parser.add_argument("--profile", choices=("target", "tawseem"), help=argparse.SUPPRESS)
     return parser
 
 
@@ -73,59 +74,56 @@ def _percentile(values: list[float], fraction: float) -> float:
     return sorted(values)[min(int(len(values) * fraction), len(values) - 1)]
 
 
-def _bounds(
-    source_lengths: list[int],
-    target_lengths: list[int],
-    max_batch: int,
-    state_budget: int | None,
-) -> list[tuple[int, int, int, int]]:
-    result = []
-    begin = 0
-    while begin < len(source_lengths):
-        end = begin
-        max_source = 0
-        max_target = 0
-        limit = min(begin + max_batch, len(source_lengths))
-        while end < limit:
-            candidate_source = max(max_source, source_lengths[end])
-            candidate_target = max(max_target, target_lengths[end])
-            candidate_size = end - begin + 1
-            states = candidate_size * candidate_source * (candidate_target + 1)
-            if end > begin and state_budget is not None and states > state_budget:
-                break
-            max_source = candidate_source
-            max_target = candidate_target
-            end += 1
-        result.append((begin, end, max_source, max_target))
-        begin = end
-    return result
-
-
 def _profile_length_batches(args) -> list[tuple[list[int], list[int]]]:
     batch = args.batch_size or (32 if args.profile == "target" else 48)
     if args.profile == "target":
-        return [([400] * batch, [128] * batch)]
+        if not 0.0 < args.min_length_fraction <= 1.0:
+            raise ValueError("--min-length-fraction must be in (0, 1]")
+        denominator = max(batch - 1, 1)
+        fractions = [
+            args.min_length_fraction + (1.0 - args.min_length_fraction) * i / denominator for i in range(batch)
+        ]
+        source_lengths = [max(1, round(args.source_length * fraction)) for fraction in fractions]
+        target_lengths = [max(0, round(args.target_length * fraction)) for fraction in fractions]
+        return [(source_lengths, target_lengths)]
+
     if args.length_profile is None:
         raise ValueError("--length-profile is required for the tawseem profile")
     payload = json.loads(args.length_profile.read_text())
     items = payload["batches"]
     if not args.replay_all_tawseem:
         if not 0 <= args.profile_index < len(items):
-            raise ValueError(
-                f"--profile-index must be in [0, {len(items) - 1}], got {args.profile_index}"
-            )
+            raise ValueError(f"--profile-index must be in [0, {len(items) - 1}], got {args.profile_index}")
         items = [items[args.profile_index]]
     result = []
     for item in items:
         if batch > len(item["input_lengths"]):
-            raise ValueError(
-                f"TAWSEEM profile contains only {len(item['input_lengths'])} samples"
-            )
+            raise ValueError(f"TAWSEEM profile contains only {len(item['input_lengths'])} samples")
         result.append((item["input_lengths"][:batch], item["target_lengths"][:batch]))
     return result
 
 
+def _fixed_chunks(source_lengths, target_lengths, chunk_size):
+    chunks = []
+    for begin in range(0, len(source_lengths), chunk_size):
+        end = min(begin + chunk_size, len(source_lengths))
+        chunks.append(
+            argparse.Namespace(
+                begin=begin,
+                end=end,
+                max_source=max(source_lengths[begin:end]),
+                max_target=max(target_lengths[begin:end]),
+            )
+        )
+    return chunks
+
+
 def _build_loss(method, blank):
+    if method == "native_rnnt":
+        from nemo.collections.asr.losses.native_rnnt import NativeRNNTLoss
+
+        return NativeRNNTLoss(blank=blank, fastemit_lambda=0.0, clamp=-1.0)
+
     from nemo.collections.asr.losses.rnnt import RNNTLoss
 
     kwargs = None
@@ -137,12 +135,12 @@ def _build_loss(method, blank):
             "use_triton": True,
             "cast_to_float32": False,
         }
-    elif method in {"native_rnnt", "flash_rnnt"}:
-        kwargs = {"fastemit_lambda": 0.0, "clamp": -1.0}
-    loss_name = "native_rnnt" if method == "flash_rnnt" else method
-    loss = RNNTLoss(
-        num_classes=blank, reduction=None, loss_name=loss_name, loss_kwargs=kwargs
-    )
+    elif method == "flash_rnnt":
+        kwargs = {
+            "fastemit_lambda": 0.0,
+            "clamp": -1.0,
+        }
+    loss = RNNTLoss(num_classes=blank, reduction=None, loss_name=method, loss_kwargs=kwargs)
     if method == "warprnnt_numba":
         # Numba does not accept BF16 activations.
         loss._force_float32 = True
@@ -156,6 +154,8 @@ def _run_job(args) -> dict:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("--dropout must be in [0, 1)")
     torch.manual_seed(12345)
     torch.cuda.manual_seed_all(12345)
     device = torch.device("cuda")
@@ -169,33 +169,27 @@ def _run_job(args) -> dict:
     max_target = max(max(target) for _, target in length_batches)
     blank = vocab - 1
 
-    if args.mode in {"state_budget_only", "state_budget"}:
-        max_chunk_batch = args.max_budget_batch_size
-        state_budget = args.state_budget
-    else:
-        max_chunk_batch = args.fused_batch_size
-        state_budget = None
+    max_chunk_batch = args.fused_batch_size
     joint = RNNTJoint(
         jointnet={
             "encoder_hidden": 512,
             "pred_hidden": 640,
             "joint_hidden": 640,
             "activation": "relu",
-            "dropout": 0.0,
+            "dropout": args.dropout,
         },
         num_classes=blank,
         log_softmax=False,
+        fuse_loss_wer=args.method == "flash_rnnt",
+        fused_batch_size=max_chunk_batch if args.method == "flash_rnnt" else None,
     ).to(device=device, dtype=dtype)
     loss = _build_loss(args.method, blank).to(device)
-    encoder = torch.randn(
-        batch, 512, max_source, device=device, dtype=dtype, requires_grad=True
-    )
-    predictor = torch.randn(
-        batch, 640, max_target + 1, device=device, dtype=dtype, requires_grad=True
-    )
-    targets = torch.randint(
-        0, blank, (batch, max_target), device=device, dtype=torch.int64
-    )
+    if args.method == "flash_rnnt":
+        joint.set_loss(loss)
+        joint.set_wer(object())
+    encoder = torch.randn(batch, 512, max_source, device=device, dtype=dtype, requires_grad=True)
+    predictor = torch.randn(batch, 640, max_target + 1, device=device, dtype=dtype, requires_grad=True)
+    targets = torch.randint(0, blank, (batch, max_target), device=device, dtype=torch.int64)
     device_length_batches = [
         (
             torch.tensor(source, device=device, dtype=torch.int64),
@@ -203,32 +197,13 @@ def _run_job(args) -> dict:
         )
         for source, target in length_batches
     ]
-    reported_chunks = [
-        _bounds(source, target, max_chunk_batch, state_budget)
-        for source, target in length_batches
-    ]
+    reported_chunks = [_fixed_chunks(source, target, max_chunk_batch) for source, target in length_batches]
 
     def iteration_chunks(source_lengths, target_lengths):
-        if args.mode == "before":
-            # Match NeMo's original fused loop, including per-chunk CUDA maxima.
-            chunks = []
-            for begin in range(0, batch, max_chunk_batch):
-                end = min(begin + max_chunk_batch, batch)
-                chunks.append(
-                    (
-                        begin,
-                        end,
-                        int(source_lengths[begin:end].max()),
-                        int(target_lengths[begin:end].max()),
-                    )
-                )
-            return chunks
-        # Match the optimized scheduler's single transfer of both length arrays.
-        return _bounds(
+        return _fixed_chunks(
             source_lengths.tolist(),
             target_lengths.tolist(),
             max_chunk_batch,
-            state_budget,
         )
 
     def clear_gradients():
@@ -248,33 +223,25 @@ def _run_job(args) -> dict:
         encoder_t = profile_encoder.transpose(1, 2)
         predictor_t = profile_predictor.transpose(1, 2)
         if args.method == "flash_rnnt":
-            from nemo.collections.asr.losses.flash_rnnt import (
-                flash_rnnt_loss_from_joint,
-            )
-
-            value = flash_rnnt_loss_from_joint(
-                joint,
-                profile_encoder,
-                profile_predictor,
-                profile_targets,
-                source_lengths,
-                target_lengths,
-                loss._loss,
-                workspace_batch_size=max_chunk_batch,
-                state_budget=state_budget,
-            ).mean()
+            value = joint(
+                encoder_outputs=profile_encoder,
+                decoder_outputs=profile_predictor,
+                encoder_lengths=source_lengths,
+                transcripts=profile_targets,
+                transcript_lengths=target_lengths,
+            )[0].mean()
             value.backward()
             return value
-        if args.mode in {"before", "state_budget_only"}:
+        if args.mode == "before":
             projected_encoder = projected_predictor = None
         else:
             projected_encoder = joint.project_encoder(encoder_t)
             projected_predictor = joint.project_prednet(predictor_t)
         losses = []
-        for begin, end, chunk_source, chunk_target in iteration_chunks(
-            source_lengths, target_lengths
-        ):
-            if args.mode in {"before", "state_budget_only"}:
+        for chunk in iteration_chunks(source_lengths, target_lengths):
+            begin, end = chunk.begin, chunk.end
+            chunk_source, chunk_target = chunk.max_source, chunk.max_target
+            if args.mode == "before":
                 logits = joint.joint(
                     encoder_t[begin:end, :chunk_source],
                     predictor_t[begin:end, : chunk_target + 1],
@@ -284,15 +251,21 @@ def _run_job(args) -> dict:
                     projected_encoder[begin:end, :chunk_source],
                     projected_predictor[begin:end, : chunk_target + 1],
                 )
-            loss_fn = loss if args.no_reuse_logits else loss._forward_fused
-            losses.append(
-                loss_fn(
+            if args.method == "native_rnnt":
+                chunk_loss = loss(
+                    logits,
+                    profile_targets[begin:end, :chunk_target],
+                    source_lengths[begin:end],
+                    target_lengths[begin:end],
+                )
+            else:
+                chunk_loss = loss(
                     log_probs=logits,
                     targets=profile_targets[begin:end, :chunk_target],
                     input_lengths=source_lengths[begin:end],
                     target_lengths=target_lengths[begin:end],
                 )
-            )
+            losses.append(chunk_loss)
         value = torch.cat(losses).mean()
         value.backward()
         return value
@@ -340,14 +313,11 @@ def _run_job(args) -> dict:
         "mode": args.mode,
         "profile": args.profile,
         "batch_size": batch,
-        "fused_batch_size": None if args.method == "flash_rnnt" else max_chunk_batch,
-        "flash_workspace_batch_size": max_chunk_batch if args.method == "flash_rnnt" else None,
-        "state_budget": state_budget,
+        "fused_batch_size": max_chunk_batch,
+        "dropout": args.dropout,
         "profile_batches": len(length_batches),
-        "chunks_p50": statistics.median(
-            [len(profile_chunks) for profile_chunks in reported_chunks]
-        ),
-        "chunk_sizes": [end - begin for begin, end, _, _ in reported_chunks[0]],
+        "chunks_p50": statistics.median([len(profile_chunks) for profile_chunks in reported_chunks]),
+        "chunk_sizes": [chunk.end - chunk.begin for chunk in reported_chunks[0]],
         "loss": float(last_loss.detach()),
         "host_p50_ms": host_p50,
         "host_p95_ms": _percentile(host_times, 0.95),
@@ -378,14 +348,12 @@ def _run_all(args) -> None:
                     profile,
                     "--fused-batch-size",
                     str(args.fused_batch_size),
-                    "--max-budget-batch-size",
-                    str(args.max_budget_batch_size),
-                    "--state-budget",
-                    str(args.state_budget),
                     "--warmup",
                     str(args.warmup),
                     "--iterations",
                     str(args.iterations),
+                    "--dropout",
+                    str(args.dropout),
                 ]
                 if args.batch_size is not None:
                     command.extend(("--batch-size", str(args.batch_size)))
@@ -395,9 +363,7 @@ def _run_all(args) -> None:
                     command.append("--replay-all-tawseem")
                 else:
                     command.extend(("--profile-index", str(args.profile_index)))
-                process = subprocess.run(
-                    command, text=True, capture_output=True, env=os.environ.copy()
-                )
+                process = subprocess.run(command, text=True, capture_output=True, env=os.environ.copy())
                 if process.returncode:
                     results.append(
                         {

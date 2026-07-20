@@ -28,6 +28,7 @@
 
 import math
 
+import numba
 import torch
 from numba import cuda
 
@@ -61,7 +62,7 @@ def logp(
         The sum of logprobs[mb, t, u, v] + denom[mb, t, u]
     """
     col = (mb * maxT + t) * maxU + u
-    return denom[col] + acts[col * alphabet_size + v]
+    return denom[col] + numba.float32(acts[col * alphabet_size + v])
 
 
 @cuda.jit(device=True, inline=True)
@@ -351,7 +352,7 @@ def compute_grad_kernel(
         while idx < alphabet_size:
             # remember, `col` represents the tri-index [b, t, u]
             # therefore; logpk = denom[b, t, u] + acts[b, t, u, v]
-            logpk = denom[col] + acts[col * alphabet_size + idx]
+            logpk = logp(denom, acts, maxT, maxU, alphabet_size, mb, t, u, idx)
             # initialize the grad of the sample acts[b, t, u, v]
             grad = math.exp(alphas[col] + betas[col] + logpk - logll[mb])
 
@@ -363,7 +364,9 @@ def compute_grad_kernel(
             if fastemit_lambda > 0.0 and u < U - 1:
                 fastemit_grad = fastemit_lambda * math.exp(
                     alphas[col]  # alphas(t, u)
-                    + (denom[col] + acts[col * alphabet_size + labels[u]])  # y_hat(t, u)
+                    + logp(
+                        denom, acts, maxT, maxU, alphabet_size, mb, t, u, labels[u]
+                    )  # y_hat(t, u)
                     + betas[col + 1]  # betas(t, u+1)
                     + logpk  # log Pr(k|t, u)
                     - logll[mb]  # total log likelihood for normalization
@@ -397,7 +400,7 @@ def compute_grad_kernel(
 
             # clamp gradient (if needed)
             if clamp > 0.0:
-                g = grads[col * alphabet_size + idx]
+                g = numba.float32(grads[col * alphabet_size + idx])
                 g = min(g, clamp)
                 g = max(g, -clamp)
                 grads[col * alphabet_size + idx] = g

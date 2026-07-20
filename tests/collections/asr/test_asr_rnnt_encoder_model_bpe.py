@@ -274,10 +274,12 @@ class TestEncDecRNNTBPEModel:
             os.makedirs(new_tokenizer_dir, exist_ok=True)
             shutil.copy2(old_tokenizer_dir, new_tokenizer_dir)
 
+            expected_fastemit = asr_model.loss._loss.fastemit_lambda
             nw1 = asr_model.num_weights
             asr_model.change_vocabulary(new_tokenizer_dir=new_tokenizer_dir, new_tokenizer_type='wpe')
             # No change
             assert nw1 == asr_model.num_weights
+            assert asr_model.loss._loss.fastemit_lambda == expected_fastemit
 
             with open(os.path.join(new_tokenizer_dir, 'vocab.txt'), 'a+') as f:
                 f.write("!\n")
@@ -285,6 +287,7 @@ class TestEncDecRNNTBPEModel:
                 f.write('@\n')
 
             asr_model.change_vocabulary(new_tokenizer_dir=new_tokenizer_dir, new_tokenizer_type='wpe')
+            assert asr_model.loss._loss.fastemit_lambda == expected_fastemit
 
             # rnn embedding + joint + bias
             pred_embedding = 3 * (asr_model.decoder.pred_hidden)
