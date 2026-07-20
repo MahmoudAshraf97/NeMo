@@ -16,7 +16,7 @@ import copy
 import io
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from math import isclose
 from typing import Any, Dict, List, Optional, Union
 
