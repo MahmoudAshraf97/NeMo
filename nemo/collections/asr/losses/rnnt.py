@@ -401,9 +401,13 @@ class RNNTLoss(Loss):
                             clamp: -1.0
                             # Safety guard only; actual padded U selects the compiled scan width.
                             max_target_tokens: 16383
+                            # Target B * T_tile * (U + 1) row budget; each tile keeps at least one T.
+                            max_joint_rows: 200000
 
-            Start ``fused_batch_size`` at the local training batch size and lower it only if the
-            disposable joint workspace is too large or benchmarks show a better throughput point.
+            ``fused_batch_size`` controls sorting and trimming granularity. ``max_joint_rows``
+            sets a workspace budget by dividing source time into balanced tiles. A tile cannot be
+            shorter than one source step, and positive gradient clamping disables tiling. Larger
+            row budgets generally improve throughput; smaller budgets reduce peak memory.
 
         Warning:
             In the case that GPU memory is exhausted in order to compute RNNTLoss, it might cause

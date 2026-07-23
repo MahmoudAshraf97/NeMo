@@ -282,6 +282,8 @@ class RnntLogProbs(torch.autograd.Function):
         (logits, targets, source_lengths, target_lengths) = ctx.saved_tensors
         blank_id = ctx.blank_id
         clamp = ctx.clamp
+        grad_target_scores = grad_target_scores.contiguous()
+        grad_blank_scores = grad_blank_scores.contiguous()
         grad_logits = logits if ctx.reuse_logits_for_grad else torch.zeros_like(logits)
         block_size = triton.next_power_of_2(logits.shape[-1])
         _rnnt_logprobs_bwd_kernel[(logits.shape[0], logits.shape[1], logits.shape[2])](

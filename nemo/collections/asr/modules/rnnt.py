@@ -1343,10 +1343,10 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         fused_batch_size: Optional int, required if `fuse_loss_wer` flag is set. Determines the size of the
             sub-batches. Should be any value below the actual batch size per GPU. With `flash_rnnt`, this is
-            the maximum number of samples in each Flash workspace chunk, not the maximum number of chunks.
-            Increase it to reduce chunk launch/recomputation overhead; decrease it when the disposable joint
-            workspace is too large. Benchmark representative lengths because throughput usually plateaus before
-            the largest possible value.
+            the maximum number of samples in each sorted and trimmed batch chunk, not the number of chunks.
+            ``loss.flash_rnnt_kwargs.max_joint_rows`` sets a target workspace row budget by tiling source time,
+            subject to a one-source-step minimum. Benchmark representative lengths because fused-batch throughput
+            usually plateaus before the largest possible value.
         masking_prob: Optional float, indicating the probability of masking out decoder output in HAINAN
             (Hybrid Autoregressive Inference Transducer) model, described in https://arxiv.org/pdf/2410.02597
             Default to -1.0, which runs standard Joint network computation; if > 0, then masking out decoder output

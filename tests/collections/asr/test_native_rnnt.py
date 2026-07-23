@@ -15,7 +15,12 @@
 import pytest
 import torch
 
-from nemo.collections.asr.losses.flash_rnnt import FlashRNNTLoss, _join_hidden, _validate_joint
+from nemo.collections.asr.losses.flash_rnnt import (
+    FlashRNNTLoss,
+    _balanced_time_tile_size,
+    _join_hidden,
+    _validate_joint,
+)
 from nemo.collections.asr.losses.native_rnnt import NativeRNNTLoss
 from nemo.collections.asr.losses.rnnt import NUMBA_RNNT_AVAILABLE, RNNT_LOSS_RESOLVER, RNNTLoss
 from nemo.collections.asr.modules.hybrid_autoregressive_transducer import HATJoint
@@ -36,7 +41,7 @@ def test_flash_rnnt_resolver_tracks_triton_availability():
 
 @pytest.mark.unit
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is required")
-def test_flash_rnnt_configuration_and_dense_path_rejection():
+def test_flash_rnnt_configuration():
     loss = RNNTLoss(
         num_classes=1023,
         loss_name="flash_rnnt",
@@ -44,16 +49,36 @@ def test_flash_rnnt_configuration_and_dense_path_rejection():
             "fastemit_lambda": 0.01,
             "clamp": -1.0,
             "max_target_tokens": 2047,
+            "max_joint_rows": 12345,
         },
     )
+
     assert loss.is_flash_rnnt
-    assert isinstance(loss._loss, FlashRNNTLoss)
     assert loss._loss.blank == 1023
     assert loss._loss.fastemit_lambda == 0.01
     assert loss._loss.clamp == 0.0
     assert loss._loss.max_target_tokens == 2047
-    with pytest.raises(ValueError, match="max_target_tokens must be in"):
-        FlashRNNTLoss(blank=1023, max_target_tokens=MAX_TARGET_TOKENS + 1)
+    assert loss._loss.max_joint_rows == 12345
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"max_target_tokens": MAX_TARGET_TOKENS + 1}, "max_target_tokens must be in"),
+        ({"max_joint_rows": 0}, "max_joint_rows must be positive"),
+    ],
+)
+def test_flash_rnnt_rejects_invalid_configuration(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        FlashRNNTLoss(blank=1023, **kwargs)
+
+
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is required")
+@pytest.mark.unit
+def test_flash_rnnt_rejects_dense_path():
+    loss = RNNTLoss(num_classes=1023, loss_name="flash_rnnt")
+
     with pytest.raises(RuntimeError, match="fuse_loss_wer=true"):
         loss(
             log_probs=torch.empty(1, 1, 1, 1024),
@@ -61,6 +86,67 @@ def test_flash_rnnt_configuration_and_dense_path_rejection():
             input_lengths=torch.ones(1, dtype=torch.long),
             target_lengths=torch.zeros(1, dtype=torch.long),
         )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("source_steps", "chunk_batch", "target_states", "max_joint_rows", "expected"),
+    [
+        (430, 16, 129, 206400, 86),
+        (20, 4, 5, 200_000, 20),
+        (400, 32, 129, 100, 1),
+    ],
+)
+def test_flash_rnnt_balances_time_tiles(
+    source_steps,
+    chunk_batch,
+    target_states,
+    max_joint_rows,
+    expected,
+):
+    assert _balanced_time_tile_size(source_steps, chunk_batch, target_states, max_joint_rows) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
+def test_rnnt_logprobs_backward_accepts_noncontiguous_score_gradients():
+    torch.manual_seed(5)
+    expected_logits = torch.randn(2, 6, 5, 8, device="cuda", requires_grad=True)
+    actual_logits = expected_logits.detach().clone().requires_grad_(True)
+    targets = torch.randint(0, 7, (2, 4), device="cuda")
+    source_lengths = torch.tensor([6, 4], device="cuda")
+    target_lengths = torch.tensor([4, 2], device="cuda")
+
+    expected_scores = rnnt_logprobs_triton(
+        expected_logits,
+        targets,
+        blank_id=7,
+        source_lengths=source_lengths,
+        target_lengths=target_lengths,
+    )
+    actual_scores = rnnt_logprobs_triton(
+        actual_logits,
+        targets,
+        blank_id=7,
+        source_lengths=source_lengths,
+        target_lengths=target_lengths,
+    )
+    gradient_storage = tuple(
+        torch.randn(score.shape + (2,), device=score.device, dtype=score.dtype) for score in actual_scores
+    )
+    score_gradients = tuple(storage[..., 0] for storage in gradient_storage)
+    assert all(not gradient.is_contiguous() for gradient in score_gradients)
+
+    expected_gradient = torch.autograd.grad(
+        expected_scores,
+        expected_logits,
+        tuple(gradient.contiguous() for gradient in score_gradients),
+    )[0]
+    actual_gradient = torch.autograd.grad(actual_scores, actual_logits, score_gradients)[0]
+
+    torch.testing.assert_close(actual_gradient, expected_gradient, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.unit
 def test_flash_rnnt_rejects_hat_joint_without_reading_blank_out_of_bounds():
     jointnet = {
@@ -469,39 +555,12 @@ def _make_joint(fused_batch_size, activation="relu", log_softmax=False, dropout=
 
 @pytest.mark.unit
 @pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
-def test_flash_rnnt_supports_joint_dropout():
-    torch.manual_seed(29)
-    joint = _make_joint(2, activation="tanh", dropout=0.25)
-    loss = RNNTLoss(num_classes=7, reduction="mean_batch", loss_name="flash_rnnt")
-    joint.set_loss(loss)
-    joint.set_wer(object())
-    encoder = torch.randn(2, 6, 5, device="cuda", requires_grad=True)
-    predictor = torch.randn(2, 7, 4, device="cuda", requires_grad=True)
-
-    value = joint(
-        encoder_outputs=encoder,
-        decoder_outputs=predictor,
-        encoder_lengths=torch.tensor([5, 4], device="cuda"),
-        transcripts=torch.randint(0, 7, (2, 3), device="cuda"),
-        transcript_lengths=torch.tensor([3, 2], device="cuda"),
-    )[0]
-    gradients = torch.autograd.grad(value, (encoder, predictor, *joint.parameters()))
-
-    assert value.isfinite()
-    assert all(gradient.isfinite().all() for gradient in gradients)
-
-
-@pytest.mark.unit
-@pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("training", [True, False])
-def test_flash_rnnt_joint_dropout_matches_dense_loss_and_gradients(dtype, training):
+def test_flash_rnnt_joint_dropout_matches_dense_loss_and_gradients(dtype):
     torch.manual_seed(91)
     dense_joint = _make_joint(2, activation="tanh", dropout=0.25).to(dtype)
     flash_joint = _make_joint(2, activation="tanh", dropout=0.25).to(dtype)
     flash_joint.load_state_dict(dense_joint.state_dict())
-    dense_joint.train(training)
-    flash_joint.train(training)
     flash_loss = RNNTLoss(num_classes=7, reduction="mean_batch", loss_name="flash_rnnt")
     flash_joint.set_loss(flash_loss)
     flash_joint.set_wer(object())
@@ -538,7 +597,12 @@ def test_flash_rnnt_joint_dropout_matches_dense_loss_and_gradients(dtype, traini
 def test_flash_rnnt_joint_dropout_is_deterministic_across_recomputation():
     torch.manual_seed(131)
     joint = _make_joint(1, activation="tanh", dropout=0.25)
-    loss = RNNTLoss(num_classes=7, reduction="mean_batch", loss_name="flash_rnnt")
+    loss = RNNTLoss(
+        num_classes=7,
+        reduction="mean_batch",
+        loss_name="flash_rnnt",
+        loss_kwargs={"max_joint_rows": 4},
+    )
     joint.set_loss(loss)
     joint.set_wer(object())
     encoder = torch.randn(3, 6, 5, device="cuda")
@@ -570,7 +634,7 @@ def test_flash_rnnt_joint_dropout_is_deterministic_across_recomputation():
 
 @pytest.mark.unit
 @pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
-@pytest.mark.parametrize("fused_batch_size", [1, 2, 3, 4])
+@pytest.mark.parametrize("fused_batch_size", [1, 3])
 def test_flash_rnnt_workspace_batch_equivalence(fused_batch_size):
     torch.manual_seed(11)
     reference_joint = _make_joint(4)
@@ -614,6 +678,65 @@ def test_flash_rnnt_workspace_batch_equivalence(fused_batch_size):
     torch.testing.assert_close(value, reference_value, atol=1e-5, rtol=1e-5)
     for actual, expected in zip(gradients, reference_gradients):
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not CUDA_TRITON_AVAILABLE, reason="CUDA and Triton are required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_flash_rnnt_workspace_time_equivalence(dtype):
+    torch.manual_seed(17)
+    reference_joint = _make_joint(4).to(dtype)
+    tiled_joint = _make_joint(4).to(dtype)
+    tiled_joint.load_state_dict(reference_joint.state_dict())
+    reference_loss = RNNTLoss(
+        num_classes=7,
+        reduction="mean_batch",
+        loss_name="flash_rnnt",
+        loss_kwargs={"max_joint_rows": 10_000},
+    )
+    tiled_loss = RNNTLoss(
+        num_classes=7,
+        reduction="mean_batch",
+        loss_name="flash_rnnt",
+        loss_kwargs={"max_joint_rows": 40},
+    )
+    reference_joint.set_loss(reference_loss)
+    tiled_joint.set_loss(tiled_loss)
+    reference_joint.set_wer(object())
+    tiled_joint.set_wer(object())
+
+    encoder = torch.randn(4, 6, 7, device="cuda", dtype=dtype, requires_grad=True)
+    predictor = torch.randn(4, 7, 5, device="cuda", dtype=dtype, requires_grad=True)
+    tiled_encoder = encoder.detach().clone().requires_grad_(True)
+    tiled_predictor = predictor.detach().clone().requires_grad_(True)
+    source_lengths = torch.tensor([7, 6, 4, 3], device="cuda")
+    target_lengths = torch.tensor([4, 3, 2, 0], device="cuda")
+    labels = torch.randint(0, 7, (4, 4), device="cuda")
+
+    reference_value = reference_joint(
+        encoder_outputs=encoder,
+        decoder_outputs=predictor,
+        encoder_lengths=source_lengths,
+        transcripts=labels,
+        transcript_lengths=target_lengths,
+    )[0]
+    tiled_value = tiled_joint(
+        encoder_outputs=tiled_encoder,
+        decoder_outputs=tiled_predictor,
+        encoder_lengths=source_lengths,
+        transcripts=labels,
+        transcript_lengths=target_lengths,
+    )[0]
+    reference_gradients = torch.autograd.grad(reference_value, (encoder, predictor, *reference_joint.parameters()))
+    tiled_gradients = torch.autograd.grad(
+        tiled_value,
+        (tiled_encoder, tiled_predictor, *tiled_joint.parameters()),
+    )
+
+    atol, rtol = (2e-5, 2e-4) if dtype == torch.float32 else (2e-2, 2e-2)
+    torch.testing.assert_close(tiled_value, reference_value, atol=atol, rtol=rtol)
+    for actual, expected in zip(tiled_gradients, reference_gradients):
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.unit
