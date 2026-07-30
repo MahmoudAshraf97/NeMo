@@ -475,13 +475,9 @@ class RNNTLoss(Loss):
         return False
 
     @property
-    def is_flash_rnnt(self) -> bool:
-        return isinstance(self._loss, FlashRNNTLoss)
-
-    @property
     def requires_factorized_joint(self) -> bool:
         """Whether this loss consumes encoder/predictor projections before dense joint logits."""
-        return self.is_flash_rnnt
+        return isinstance(self._loss, FlashRNNTLoss)
 
     def reduce(self, losses, target_lengths):
 
