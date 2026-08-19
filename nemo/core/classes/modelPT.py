@@ -23,36 +23,24 @@ from os import path
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-import hydra
 import torch
-
-from nemo.core.classes.module import NeuralModule
-from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
-
-try:
-    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-    from megatron.core.utils import get_model_config
-
-    HAVE_MEGATRON_CORE = True
-
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_MEGATRON_CORE = False
-
 from lightning.pytorch import LightningModule, Trainer
 from lightning.pytorch.utilities import model_summary, rank_zero_only
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo import package_info
 from nemo.core import optim
-from nemo.core.classes.common import Model
+from nemo.core.classes.common import Model, safe_instantiate
+from nemo.core.classes.module import NeuralModule
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
-from nemo.core.optim import McoreDistributedOptimizer, prepare_lr_scheduler
+from nemo.core.optim import prepare_lr_scheduler
+from nemo.lightning.callback_group import CallbackGroup
 from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.debug_hook import register_debug_hooks
 from nemo.utils.exceptions import NeMoBaseException
 from nemo.utils.get_rank import get_rank, is_global_rank_zero
+from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
 __all__ = ['ModelPT']
 
@@ -86,6 +74,10 @@ class ModelPT(LightningModule, Model):
                 f"trainer constructor argument must be either None or lightning.pytorch.Trainer. "
                 f"But got {type(trainer)} instead."
             )
+
+        # Track model init start
+        CallbackGroup.get_instance().on_model_init_start()
+
         super().__init__()
 
         """
@@ -113,7 +105,7 @@ class ModelPT(LightningModule, Model):
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
 
         # Convert config to support Hydra 1.0+ instantiation
-        cfg = model_utils.maybe_update_config_version(cfg)
+        cfg = model_utils.maybe_update_config_version(cfg, make_copy=False)
 
         if 'model' in cfg:
             raise ValueError(
@@ -152,6 +144,8 @@ class ModelPT(LightningModule, Model):
         if torch.cuda.is_available() and torch.cuda.current_device() is not None:
             app_state.device_id = torch.cuda.current_device()
 
+        CallbackGroup.get_instance().on_model_init_end()
+        CallbackGroup.get_instance().on_dataloader_init_start()
         if self._cfg is not None and not self._is_model_being_restored():
             # Setup data loaders now (default) or defer setup to `self.setup()`
             # if `defer_setup` is set in the config of the corresponding dataloader.
@@ -197,6 +191,8 @@ class ModelPT(LightningModule, Model):
                     f"and provide a valid configuration file to setup the test data loader(s).\n"
                     f"Test config : \n{OmegaConf.to_yaml(self._cfg.test_ds)}"
                 )
+
+        CallbackGroup.get_instance().on_dataloader_init_end()
 
         # Create list of lists for val and test outputs to support multiple dataloaders
         # Initialize an empty list as sometimes self._validation_dl can be None at this stage
@@ -394,13 +390,14 @@ class ModelPT(LightningModule, Model):
 
     def save_to(self, save_path: str):
         """
-        Saves model instance (weights and configuration) into .nemo file
-         You can use "restore_from" method to fully restore instance from .nemo file.
+        Saves model instance (weights and configuration) into .nemo file.
+        You can use "restore_from" method to fully restore instance from .nemo file.
 
         .nemo file is an archive (tar.gz) with the following:
-            model_config.yaml - model configuration in .yaml format. You can deserialize this into cfg argument for
-                                model's constructor
-            model_wights.ckpt - model checkpoint
+
+        - model_config.yaml - model configuration in .yaml format. You can deserialize this into cfg argument for
+          model's constructor
+        - model_wights.ckpt - model checkpoint
 
         Args:
             save_path: Path to .nemo file where model instance should be saved
@@ -469,7 +466,6 @@ class ModelPT(LightningModule, Model):
         Returns:
             An instance of type cls or its underlying config (if return_config is set).
         """
-
         if save_restore_connector is None:
             save_restore_connector = SaveRestoreConnector()
 
@@ -502,6 +498,7 @@ class ModelPT(LightningModule, Model):
         )
         if isinstance(instance, ModelPT):
             instance._save_restore_connector = save_restore_connector
+
         return instance
 
     @classmethod
@@ -518,6 +515,9 @@ class ModelPT(LightningModule, Model):
         Loads ModelPT from checkpoint, with some maintenance of restoration.
         For documentation, please refer to LightningModule.load_from_checkpoint() documentation.
         """
+        # Notify OneLogger of checkpoint loading start for telemetry tracking
+        CallbackGroup.get_instance().on_load_checkpoint_start()
+
         checkpoint = None
         try:
             cls._set_model_restore_state(is_being_restored=True)
@@ -533,6 +533,10 @@ class ModelPT(LightningModule, Model):
 
         finally:
             cls._set_model_restore_state(is_being_restored=False)
+
+        # Notify OneLogger of checkpoint loading completion for telemetry tracking
+        CallbackGroup.get_instance().on_load_checkpoint_end()
+
         return checkpoint
 
     @abstractmethod
@@ -578,9 +582,9 @@ class ModelPT(LightningModule, Model):
             val_data_layer_config: validation data layer parameters.
         """
         # Set some placeholder overriden by helper method
-        self._val_dl_idx = 0
-        self._validation_names = None
-        self._validation_dl = None  # type: torch.utils.data.DataLoader
+        self._val_dl_idx: int = 0
+        self._validation_names: Optional[List[str]] = None
+        self._validation_dl: Optional[torch.utils.data.DataLoader] = None
 
         # preserve config
         self._update_dataset_config(dataset_name='validation', config=val_data_config)
@@ -603,9 +607,9 @@ class ModelPT(LightningModule, Model):
             test_data_layer_config: test data layer parameters.
         """
         # Set some placeholder overriden by helper method
-        self._test_dl_idx = 0
-        self._test_names = None
-        self._test_dl = None  # type: torch.utils.data.DataLoader
+        self._test_dl_idx: int = 0
+        self._test_names: Optional[List[str]] = None
+        self._test_dl: Optional[torch.utils.data.DataLoader] = None
 
         # preserve config
         self._update_dataset_config(dataset_name='test', config=test_data_config)
@@ -619,33 +623,6 @@ class ModelPT(LightningModule, Model):
         if self._test_names is None:
             if self._test_dl is not None and type(self._test_dl) in [list, tuple]:
                 self._test_names = ['test_{}_'.format(idx) for idx in range(len(self._test_dl))]
-
-    def setup_megatron_optimization(self, optim_config: Union[Dict[str, Any], DictConfig]):
-        """
-        Setup mcore optimizer config.
-
-        Args:
-            optim_config: Nemo optim args used to set up Mcore optimizer options.
-        """
-
-        config = get_model_config(self.model[0])
-
-        megatron_optim_config = OptimizerConfig(
-            fp16=config.fp16,
-            bf16=config.bf16,
-            params_dtype=config.params_dtype,
-            lr=optim_config['lr'],
-            weight_decay=optim_config['weight_decay'],
-            adam_beta1=optim_config['betas'][0],
-            adam_beta2=optim_config['betas'][1],
-            adam_eps=optim_config.get('eps', OptimizerConfig.adam_eps),
-            clip_grad=self.trainer.gradient_clip_val,
-            use_distributed_optimizer=self.use_mcore_dist_optim,
-            overlap_param_gather_with_optimizer_step=self.cfg.optim.get(
-                'overlap_param_gather_with_optimizer_step', False
-            ),
-        )
-        return megatron_optim_config
 
     def setup_optimization(
         self,
@@ -729,7 +706,8 @@ class ModelPT(LightningModule, Model):
 
         if optimizer_cls is None:
             # Try to get optimizer name for dynamic resolution, defaulting to Adam
-            optimizer_name = optim_config.get('name', 'adam')
+            # Use or instead of default as None will also results in default value not used.
+            optimizer_name = optim_config.get('name') or 'adam'
         else:
             if inspect.isclass(optimizer_cls):
                 optimizer_name = optimizer_cls.__name__.lower()
@@ -780,7 +758,7 @@ class ModelPT(LightningModule, Model):
                         optimizer_config = {}
                     optimizer_config.update(optimizer_args)
 
-                    optimizer_instance = hydra.utils.instantiate(
+                    optimizer_instance = safe_instantiate(
                         optimizer_cls, self._optimizer_param_groups, **optimizer_config
                     )  # type: DictConfig
 
@@ -797,23 +775,14 @@ class ModelPT(LightningModule, Model):
                     raise e
 
         else:
-            if optimizer_name == 'mcore_distributed_optim':
-                # setup megatron_optim_config and get Mcore based optimizer with the wrapper
-                megatron_optim_config = self.setup_megatron_optimization(optimizer_args)
-                _megatron_optimizer = get_megatron_optimizer(
-                    megatron_optim_config,
-                    self.model,
-                )
-                optimizer = McoreDistributedOptimizer(_megatron_optimizer)
+            optimizer = optim.get_optimizer(optimizer_name)
+            optimizer = optimizer(self._optimizer_param_groups, **optimizer_args)
 
-            else:
-                optimizer = optim.get_optimizer(optimizer_name)
-                optimizer = optimizer(self._optimizer_param_groups, **optimizer_args)
-
-                logging.info("Optimizer config = %s", str(optimizer))
+            logging.info("Optimizer config = %s", str(optimizer))
 
             self._optimizer = optimizer
 
+        optim.patch_flashoptim_uneven_shard_support(self._optimizer)
         self._scheduler = prepare_lr_scheduler(
             optimizer=self._optimizer, scheduler_config=scheduler_config, train_dataloader=self._train_dl
         )
@@ -890,7 +859,11 @@ class ModelPT(LightningModule, Model):
         """
         Configure the optimizer and scheduler.
         """
+        # Track optimizer init start
+        CallbackGroup.get_instance().on_optimizer_init_start()
         self.setup_optimization()
+
+        CallbackGroup.get_instance().on_optimizer_init_end()
 
         if self._scheduler is None:
             return self._optimizer
@@ -954,6 +927,9 @@ class ModelPT(LightningModule, Model):
             )
             if no_test_dataloader and test_deferred_setup:
                 self.setup_multiple_test_data(test_data_config=self._cfg.test_ds)
+
+        if stage == 'fit':
+            CallbackGroup.get_instance().update_config(nemo_version='v1', trainer=self._trainer)
 
     def train_dataloader(self):
         """
@@ -1344,6 +1320,8 @@ class ModelPT(LightningModule, Model):
                 f"Found : {[args[idx] for idx, arg_present in enumerate(arg_matches) if arg_present]}"
             )
 
+        CallbackGroup.get_instance().on_load_checkpoint_start()
+
         if 'init_from_nemo_model' in cfg and cfg.init_from_nemo_model is not None:
             with open_dict(cfg):
                 if isinstance(cfg.init_from_nemo_model, str):
@@ -1460,6 +1438,9 @@ class ModelPT(LightningModule, Model):
                 else:
                     raise TypeError("Invalid type: init_from_ptl_ckpt is not a string or a dict!")
 
+        # Track load checkpoint end
+        CallbackGroup.get_instance().on_load_checkpoint_end()
+
     def teardown(self, stage: str):
         """
         Called at the end of fit and test.
@@ -1497,35 +1478,29 @@ class ModelPT(LightningModule, Model):
             save_restore_connector (SaveRestoreConnector): Can be overrided to add custom save and restore logic.
 
         Example:
-            To convert the .nemo tarfile into a single Model level PyTorch checkpoint
-            ::
-            state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from('asr.nemo', './asr_ckpts')
+            To convert the .nemo tarfile into a single Model level PyTorch checkpoint::
 
+                state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from('asr.nemo', './ckpts')
 
-            To restore a model from a Model level checkpoint
-            ::
-            model = nemo.collections.asr.models.EncDecCTCModel(cfg)  # or any other method of restoration
-            model.load_state_dict(torch.load("./asr_ckpts/model_weights.ckpt"))
+            To restore a model from a Model level checkpoint::
 
+                model = nemo.collections.asr.models.EncDecCTCModel(cfg)  # or any other method of restoration
+                model.load_state_dict(torch.load("./ckpts/model_weights.ckpt"))
 
-            To convert the .nemo tarfile into multiple Module level PyTorch checkpoints
-            ::
-            state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from(
-                            'asr.nemo',
-                            './asr_ckpts',
-                            split_by_module=True
-                        )
+            To convert the .nemo tarfile into multiple Module level PyTorch checkpoints::
 
+                state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from(
+                    'asr.nemo', './ckpts', split_by_module=True
+                )
 
-            To restore a module from a Module level checkpoint
-            ::
-            model = nemo.collections.asr.models.EncDecCTCModel(cfg)  # or any other method of restoration
+            To restore a module from a Module level checkpoint::
 
-            # load the individual components
-            model.preprocessor.load_state_dict(torch.load("./asr_ckpts/preprocessor.ckpt"))
-            model.encoder.load_state_dict(torch.load("./asr_ckpts/encoder.ckpt"))
-            model.decoder.load_state_dict(torch.load("./asr_ckpts/decoder.ckpt"))
+                model = nemo.collections.asr.models.EncDecCTCModel(cfg)  # or any other method of restoration
 
+                # load the individual components
+                model.preprocessor.load_state_dict(torch.load("./ckpts/preprocessor.ckpt"))
+                model.encoder.load_state_dict(torch.load("./ckpts/encoder.ckpt"))
+                model.decoder.load_state_dict(torch.load("./ckpts/decoder.ckpt"))
 
         Returns:
             The state dict that was loaded from the original .nemo checkpoint

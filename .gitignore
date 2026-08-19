@@ -88,6 +88,7 @@ instance/
 
 # Sphinx documentation
 docs/build
+docs/source/_build
 
 # PyBuilder
 target/
@@ -181,3 +182,16 @@ examples/neural_graphs/*.yml
 nemo_experiments/
 
 slurm*.out
+
+# Onelogger
+onelogger.*
+
+# voice agent
+node_modules/
+.vite/
+bot_server.*
+audio_logs/
+eval_results/
+
+# agents
+.claude/settings.local.json

@@ -43,7 +43,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         # Convert to Hydra 1.0 compatible DictConfig
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
-        cfg = model_utils.maybe_update_config_version(cfg)
+        cfg = model_utils.maybe_update_config_version(cfg, make_copy=False)
 
         # Tokenizer is necessary for this model
         if 'tokenizer' not in cfg:
@@ -233,6 +233,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             batch_size = min(config['batch_size'], len(config['paths2audio_files']))
 
         dl_config = {
+            'use_lhotse': config.get('use_lhotse', True),
             'manifest_filepath': manifest_filepath,
             'sample_rate': self.preprocessor._sample_rate,
             'batch_size': batch_size,
@@ -292,7 +293,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 )
 
             if new_tokenizer_type.lower() not in ('bpe', 'wpe'):
-                raise ValueError(f'New tokenizer type must be either `bpe` or `wpe`')
+                raise ValueError(f'New tokenizer type must be either `bpe` or `wpe`, got {new_tokenizer_type}')
 
             tokenizer_cfg = OmegaConf.create({'dir': new_tokenizer_dir, 'type': new_tokenizer_type})
 
