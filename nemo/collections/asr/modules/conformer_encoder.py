@@ -193,6 +193,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             positional encoding buffers on all GPUs. Disabling this setting may help with deadlocks in certain
             scenarios such as model parallelism, or generally when this module is not being ran on some GPUs
             as a part of the training step.
+        streaming_cold_start (bool): when true, the ``drop_extra_pre_encoded`` trim is also applied on the
+            non-cache (masked) training path, so that the model's first output frame is defined exactly as a
+            cache-aware streaming step computes it. Must be paired with the matching leading-silence pad that
+            ``ASRModel._pad_streaming_cold_start`` applies to the waveform; the encoder exposes the required pad
+            size via the ``cold_start_pad_frames`` property. Enabling this changes the model's definition of
+            frame 0, so it is a training-time choice and existing checkpoints must leave it off.
+            Defaults to False.
     """
 
     def input_example(self, max_batch=1, max_dim=256):
@@ -350,6 +357,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         rope_base: float = 10000.0,
         rotary_fraction: float = 1.0,
         use_triton: bool | None = None,
+        streaming_cold_start: bool = False,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -531,6 +539,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
 
+        self.streaming_cold_start = streaming_cold_start
         self.setup_streaming_params()
         self.export_cache_support = False
 
@@ -680,7 +689,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
                 length = length.to(torch.int64)
                 # `self.streaming_cfg` is set by setup_streaming_cfg(), called in the init
-                if self.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
+                if self.streaming_cfg.drop_extra_pre_encoded > 0 and (
+                    cache_last_channel is not None or self.streaming_cold_start
+                ):
                     audio_signal = audio_signal[:, self.streaming_cfg.drop_extra_pre_encoded :, :]
                     length = (length - self.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
 
@@ -1116,6 +1127,24 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     m.cache_drop_size = streaming_cfg.cache_drop_size
 
         self.streaming_cfg = streaming_cfg
+
+    @property
+    def cold_start_pad_frames(self) -> int:
+        """Feature frames of leading silence this encoder expects on its input.
+
+        Equal to ``pre_encode_cache_size`` -- the left context every steady-state streaming window
+        carries from the previous one. The first window has no previous window, so it sees that many
+        zero frames instead. Prepending the same amount here, and dropping ``drop_extra_pre_encoded``
+        pre-encoded frames, makes the non-cache (masked) forward compute its first output frame
+        exactly as a cache-aware streaming step does, so a model trained this way is exact against
+        its own streaming deployment from the very first chunk.
+
+        Zero unless ``streaming_cold_start`` is set.
+        """
+        if not getattr(self, "streaming_cold_start", False):
+            return 0
+        cache_size = self.streaming_cfg.pre_encode_cache_size
+        return cache_size[1] if isinstance(cache_size, list) else cache_size
 
     def get_initial_cache_state(self, batch_size=1, dtype=torch.float32, device=None, max_dim=0):
         if device is None:

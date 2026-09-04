@@ -32,6 +32,24 @@ __all__ = ['ASRModel']
 
 
 class ASRModel(ModelPT, WithOptionalCudaGraphs, ABC):
+    def _pad_streaming_cold_start(self, input_signal, input_signal_length):
+        """Prepend the leading silence a cache-aware streaming deployment feeds on its first window.
+
+        The server's first streaming window carries ``drop_extra_pre_encoded * subsampling_factor`` frames of
+        digital silence ahead of the audio, while later windows carry none. Training through the masked
+        non-cache path sees no such lead-in, so the first chunk is the one place the two paths disagree.
+        Padding here -- after all dataloader augmentation and before the preprocessor -- reproduces that
+        lead-in bit-exactly, and pairs with the encoder's ``streaming_cold_start`` flag, which drops the
+        resulting extra pre-encoded frames again so no real audio is lost.
+
+        A no-op unless the encoder asks for it, so every existing model is unaffected.
+        """
+        frames = getattr(self.encoder, "cold_start_pad_frames", 0)
+        if not frames:
+            return input_signal, input_signal_length
+        n = frames * self.preprocessor.featurizer.hop_length
+        return torch.nn.functional.pad(input_signal, (n, 0)), input_signal_length + n
+
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         val_loss = {}
         tensorboard_logs = {}

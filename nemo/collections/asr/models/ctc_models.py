@@ -525,6 +525,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             )
 
         if not has_processed_signal:
+            input_signal, input_signal_length = self._pad_streaming_cold_start(input_signal, input_signal_length)
             processed_signal, processed_signal_length = self.preprocessor(
                 input_signal=input_signal,
                 length=input_signal_length,
