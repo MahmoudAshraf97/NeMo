@@ -97,6 +97,7 @@ if TRITON_AVAILABLE:
         states_ptr,
         hidden_ptr,
         seed_ptr,
+        predictor_mask_ptr,
         tile_start,
         batch,
         source_stride,
@@ -121,7 +122,9 @@ if TRITON_AVAILABLE:
             encoder_ptr + (batch_idx * source_stride + source_idx) * hidden_size + offsets, mask=mask, other=0.0
         ).to(tl.float32)
         predictor = tl.load(
-            predictor_ptr + (batch_idx * target_stride + target_idx) * hidden_size + offsets, mask=mask, other=0.0
+            predictor_ptr + (batch_idx * target_stride + target_idx) * hidden_size + offsets,
+            mask=mask & tl.load(predictor_mask_ptr + batch_idx * target_stride + target_idx),
+            other=0.0,
         ).to(tl.float32)
         hidden = _activate_fwd(encoder + predictor, activation)
         rng_base = row * _rng_row_stride(hidden_size)
@@ -175,6 +178,7 @@ if TRITON_AVAILABLE:
         grad_encoder_ptr,
         grad_predictor_ptr,
         seed_ptr,
+        predictor_mask_ptr,
         tile_start,
         tile_rows,
         batch,
@@ -239,6 +243,7 @@ if TRITON_AVAILABLE:
             local = row - tile_start
             covered = frame_mask[:, None] & state_mask[None, :] & (local >= 0) & (local < tile_rows)
 
+            state_mask &= tl.load(predictor_mask_ptr + batch_idx * target_stride + state, mask=state_mask, other=False)
             predictor = tl.load(
                 predictor_ptr + (batch_idx * target_stride + state)[:, None] * hidden_size + hidden[None, :],
                 mask=state_mask[:, None] & hidden_mask[None, :],
@@ -459,7 +464,9 @@ class _PackedJoint(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, encoder, predictor, offsets, states, lengths, seed, start, rows, activation, dropout_p):
+    def forward(
+        ctx, encoder, predictor, offsets, states, lengths, seed, predictor_mask, start, rows, activation, dropout_p
+    ):
         hidden_size = encoder.shape[2]
         hidden = torch.empty(rows, hidden_size, device=encoder.device, dtype=encoder.dtype)
         block = triton.next_power_of_2(hidden_size)
@@ -471,6 +478,7 @@ class _PackedJoint(torch.autograd.Function):
             states,
             hidden,
             seed,
+            predictor_mask,
             start,
             len(states),
             encoder.shape[1],
@@ -481,14 +489,14 @@ class _PackedJoint(torch.autograd.Function):
             batch_pow2=batch_pow2,
             block_hidden=block,
         )
-        ctx.save_for_backward(encoder, predictor, offsets, states, lengths, seed)
+        ctx.save_for_backward(encoder, predictor, offsets, states, lengths, seed, predictor_mask)
         ctx.meta = (activation, dropout_p, batch_pow2, block)
         ctx.tile_start = start
         return hidden
 
     @staticmethod
     def backward(ctx, grad_hidden):
-        encoder, predictor, offsets, states, lengths, seed = ctx.saved_tensors
+        encoder, predictor, offsets, states, lengths, seed, predictor_mask = ctx.saved_tensors
         activation, dropout_p, batch_pow2, _ = ctx.meta
         grad_hidden = grad_hidden.contiguous()
         batch, hidden_size = len(states), encoder.shape[2]
@@ -510,6 +518,7 @@ class _PackedJoint(torch.autograd.Function):
             grad_encoder,
             grad_predictor,
             seed,
+            predictor_mask,
             ctx.tile_start,
             grad_hidden.shape[0],
             batch,
@@ -523,6 +532,7 @@ class _PackedJoint(torch.autograd.Function):
         return (
             grad_encoder.to(encoder.dtype),
             grad_predictor.to(predictor.dtype),
+            None,
             None,
             None,
             None,
@@ -615,6 +625,7 @@ def packed_tile_scores(
     states,
     lengths,
     seed,
+    predictor_mask,
     start,
     rows,
     activation,
@@ -627,7 +638,9 @@ def packed_tile_scores(
 
     Both intermediates are local to the call, so it can be wrapped in ``torch.utils.checkpoint``.
     """
-    hidden = _PackedJoint.apply(encoder, predictor, offsets, states, lengths, seed, start, rows, activation, dropout_p)
+    hidden = _PackedJoint.apply(
+        encoder, predictor, offsets, states, lengths, seed, predictor_mask, start, rows, activation, dropout_p
+    )
     logits = torch.nn.functional.linear(hidden, weight, bias)
     return _PackedLogProbs.apply(logits, targets, offsets, states, start, blank_id, clamp, loss_grad_scale)
 

@@ -43,8 +43,8 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 
 def _validate_joint(joint, blank: int) -> None:
     """Reject joint configurations this path does not reproduce."""
-    if joint.is_adapter_available() or joint.masking_prob > 0.0:
-        raise ValueError("Flash RNN-T does not support adapters or HAINAN masking")
+    if joint.is_adapter_available():
+        raise ValueError("Flash RNN-T does not support adapters")
     if joint.num_extra_outputs != 0 or blank != joint.num_classes_with_blank - 1:
         raise ValueError("Flash RNN-T requires standard RNN-T with a final blank output")
     # HAT joints score blank in a separate head, leaving joint_net one column short.
@@ -124,6 +124,7 @@ def _packed_scores(
     clamp: float,
     max_joint_rows: int,
     loss_grad_scale: torch.Tensor | None,
+    predictor_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the target and blank score planes, ``[B, T, U + 1]`` each."""
     batch, source_steps = projected_encoder.shape[0], projected_encoder.shape[1]
@@ -162,6 +163,7 @@ def _packed_scores(
             states,
             lengths,
             seed,
+            predictor_mask,
             start,
             rows,
             activation,
@@ -206,6 +208,9 @@ def _compute_flash_rnnt(
     projected_encoder = joint.project_encoder(encoder)
     projected_predictor = joint.project_prednet(predictor)
 
+    masking_prob = joint.masking_prob if joint.training else -1.0
+    predictor_mask = torch.rand(batch, projected_predictor.shape[1], device=encoder.device) > masking_prob
+
     # Clamping bounds the gradient at unit scale, before the loss reduction and any AMP scale
     # multiply it. Those factors are already folded in by the time the extraction backward runs, so
     # the dynamic program publishes each sample's loss gradient in this buffer and the extraction
@@ -229,6 +234,7 @@ def _compute_flash_rnnt(
         clamp,
         max_joint_rows,
         loss_grad_scale,
+        predictor_mask,
     )
     return rnnt_loss_triton(
         target_scores[..., :-1],

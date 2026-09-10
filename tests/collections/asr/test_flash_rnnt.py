@@ -49,8 +49,9 @@ def _joint_hidden_state(encoder, predictor, activation, dropout_p=0.0):
     seed = source_lengths
     if dropout_p > 0.0:
         seed = torch.randint(0, 2**31 - 1, (1,), device=encoder.device, dtype=torch.int32)
+    predictor_mask = torch.ones(batch, target_states, device=encoder.device, dtype=torch.bool)
     hidden = _PackedJoint.apply(
-        encoder, predictor, offsets, states, source_lengths, seed, 0, total_rows, activation, dropout_p
+        encoder, predictor, offsets, states, source_lengths, seed, predictor_mask, 0, total_rows, activation, dropout_p
     )
     return hidden.view(batch, source_steps, target_states, hidden_size)
 
@@ -321,7 +322,7 @@ def _end_to_end_batch(dtype=torch.float32):
     return encoder, predictor, source_lengths, target_lengths, labels
 
 
-def _make_joint(fused_batch_size, activation="relu", log_softmax=False, dropout=0.0):
+def _make_joint(fused_batch_size, activation="relu", log_softmax=False, dropout=0.0, masking_prob=-1.0):
     return RNNTJoint(
         jointnet={
             "encoder_hidden": ENCODER_HIDDEN,
@@ -334,6 +335,7 @@ def _make_joint(fused_batch_size, activation="relu", log_softmax=False, dropout=
         log_softmax=log_softmax,
         fuse_loss_wer=True,
         fused_batch_size=fused_batch_size,
+        masking_prob=masking_prob,
     ).cuda()
 
 
@@ -626,6 +628,65 @@ def test_flash_rnnt_matches_numba_loss_and_gradients(dtype, activation):
     torch.testing.assert_close(flash_value, dense_value, atol=atol, rtol=rtol)
     for actual, expected in zip(flash_gradients, dense_gradients):
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(
+    not CUDA_TRITON_AVAILABLE or not NUMBA_RNNT_AVAILABLE,
+    reason="CUDA, Triton, and Numba RNN-T are required",
+)
+def test_flash_rnnt_prediction_masking_matches_numba():
+    """HAINAN masking zeroes a transcript state's projected predictor row; the kernels skip it instead.
+
+    The eager joint multiplies the projection by the mask, so the reference applies the same mask by
+    hand and scores the dense joint. A masked state's predictor gradient is zero there, so a backward
+    that still accumulates into it fails the comparison. The small tile budget makes the mask cross
+    tiles and the checkpoint recompute.
+    """
+    from nemo.collections.asr.parts.numba.rnnt_loss import RNNTLossNumba
+
+    masking_prob = 0.5
+    torch.manual_seed(31)
+    dense_joint = _make_joint(4)
+    flash_joint = _make_joint(4, masking_prob=masking_prob)
+    flash_joint.load_state_dict(dense_joint.state_dict())
+    flash_joint.set_loss(
+        RNNTLoss(
+            num_classes=NUM_LABELS,
+            reduction="mean_batch",
+            loss_name="flash_rnnt",
+            loss_kwargs={"max_joint_rows": 13},
+        )
+    )
+    flash_joint.set_wer(object())
+    encoder, predictor, source_lengths, target_lengths, labels = _end_to_end_batch()
+    flash_encoder = encoder.detach().clone().requires_grad_(True)
+    flash_predictor = predictor.detach().clone().requires_grad_(True)
+
+    # The loss draws its mask as the first CUDA random call after the projections, so the same seed
+    # reproduces it here.
+    torch.manual_seed(7)
+    flash_value = flash_joint(
+        encoder_outputs=flash_encoder,
+        decoder_outputs=flash_predictor,
+        encoder_lengths=source_lengths,
+        transcripts=labels,
+        transcript_lengths=target_lengths,
+    )[0]
+    torch.manual_seed(7)
+    predictor_mask = torch.rand(encoder.shape[0], predictor.shape[2], device="cuda") > masking_prob
+    assert predictor_mask.any() and not predictor_mask.all(), "the draw must mask some states and keep others"
+
+    projected_encoder = dense_joint.project_encoder(encoder.transpose(1, 2))
+    projected_predictor = dense_joint.project_prednet(predictor.transpose(1, 2)) * predictor_mask[..., None]
+    logits = dense_joint.joint_after_projection(projected_encoder, projected_predictor)
+    dense_value = RNNTLossNumba(blank=BLANK, reduction="none")(logits, labels, source_lengths, target_lengths).mean()
+    dense_gradients = torch.autograd.grad(dense_value, (encoder, predictor, *dense_joint.parameters()))
+    flash_gradients = torch.autograd.grad(flash_value, (flash_encoder, flash_predictor, *flash_joint.parameters()))
+
+    torch.testing.assert_close(flash_value, dense_value, atol=2e-5, rtol=2e-4)
+    for actual, expected in zip(flash_gradients, dense_gradients):
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
 
 
 @pytest.mark.unit
