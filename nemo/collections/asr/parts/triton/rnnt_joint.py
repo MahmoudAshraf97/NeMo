@@ -444,7 +444,7 @@ def lattice_layout(source_lengths, target_lengths, source_steps, target_states):
     """
     states = (target_lengths + 1).to(torch.int32)
     sizes = source_lengths.to(torch.int32) * states
-    offsets = torch.zeros(len(sizes) + 1, device=sizes.device, dtype=torch.int32)
+    offsets = torch.zeros(len(sizes) + 1, device=sizes.device, dtype=torch.int64)
     offsets[1:] = torch.cumsum(sizes, 0)
     total_rows, longest_source, most_states = torch.stack(
         (offsets[-1].long(), source_lengths.max().long(), states.max().long())
